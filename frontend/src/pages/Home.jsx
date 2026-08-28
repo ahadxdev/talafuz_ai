@@ -1,13 +1,31 @@
-import { useState } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { VideoUploader } from "../components/VideoUploader";
 import { VideoPreview } from "../components/VideoPreview";
 import { ProcessingStatus } from "../components/ProcessingStatus";
+import { TranscriptPanel } from "../components/TranscriptPanel";
+import { api } from "../services/api";
+
+const STATUS_POLL_INTERVAL_MS = 1500;
+const STATUS_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+const MAX_CONSECUTIVE_POLL_ERRORS = 3;
 
 export function Home() {
   const [uploadedVideo, setUploadedVideo] = useState(null);
   const [isError, setIsError] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [isUploading, setIsUploading] = useState(false);
+
+  // Phase 2 — processing state
+  const [processing, setProcessing] = useState("idle"); // idle | starting | running | completed | failed
+  const [processingStage, setProcessingStage] = useState(null);
+  const [processingErrorCode, setProcessingErrorCode] = useState(null);
+  const [processingError, setProcessingError] = useState("");
+  const [transcript, setTranscript] = useState(null);
+  const pollStopRef = useRef(() => {});
+
+  const stopPolling = useCallback(() => {
+    pollStopRef.current();
+  }, []);
 
   const handleVideoSelect = (file) => {
     setIsError(false);
@@ -20,8 +38,14 @@ export function Home() {
   };
 
   const handleUploadComplete = (response) => {
+    stopPolling();
     setUploadedVideo(response);
     setIsUploading(false);
+    setProcessing("idle");
+    setProcessingStage(null);
+    setProcessingErrorCode(null);
+    setProcessingError("");
+    setTranscript(null);
   };
 
   const handleError = (message) => {
@@ -31,11 +55,126 @@ export function Home() {
   };
 
   const handleReset = () => {
+    stopPolling();
     setUploadedVideo(null);
     setIsError(false);
     setErrorMessage("");
     setIsUploading(false);
+    setProcessing("idle");
+    setProcessingStage(null);
+    setProcessingErrorCode(null);
+    setProcessingError("");
+    setTranscript(null);
   };
+
+  // Poll GET /status until the job completes, fails, or times out.
+  useEffect(() => {
+    if (processing !== "running" || !uploadedVideo?.job_id) return undefined;
+
+    let cancelled = false;
+    let interval = null;
+    let errorCount = 0;
+    const startedAt = Date.now();
+
+    const poll = async () => {
+      try {
+        const status = await api.getJobStatus(uploadedVideo.job_id);
+        if (cancelled) return;
+        errorCount = 0;
+
+        if (status.status === "completed") {
+          try {
+            const data = await api.getTranscript(uploadedVideo.job_id);
+            if (cancelled) return;
+            setTranscript(data.segments ?? []);
+            setProcessingStage("completed");
+            setProcessing("completed");
+          } catch (err) {
+            if (cancelled) return;
+            setProcessingErrorCode("TRANSCRIPT_FETCH");
+            setProcessingError(err.message || "Failed to load transcript.");
+            setProcessing("failed");
+          }
+        } else if (status.status === "failed") {
+          setProcessingErrorCode(status.error_code ?? null);
+          setProcessingError(
+            status.error || "Processing failed. Please try again."
+          );
+          setProcessing("failed");
+        } else {
+          setProcessingStage(status.status);
+          if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
+            setProcessingErrorCode("TIMEOUT");
+            setProcessingError("Processing is taking too long. Please try again.");
+            setProcessing("failed");
+          }
+        }
+      } catch (err) {
+        if (cancelled) return;
+        errorCount += 1;
+        if (errorCount >= MAX_CONSECUTIVE_POLL_ERRORS) {
+          setProcessingErrorCode("NETWORK");
+          setProcessingError(
+            err.message || "Could not reach the server. Check that the backend is running."
+          );
+          setProcessing("failed");
+        }
+      }
+    };
+
+    poll();
+    interval = setInterval(poll, STATUS_POLL_INTERVAL_MS);
+    pollStopRef.current = () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
+
+    return () => {
+      cancelled = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [processing, uploadedVideo]);
+
+  const handleStartProcessing = async () => {
+    if (!uploadedVideo?.job_id) return;
+
+    setProcessing("starting");
+    setProcessingError("");
+    setProcessingErrorCode(null);
+    setTranscript(null);
+
+    try {
+      await api.startProcessing(uploadedVideo.job_id);
+      setProcessingStage("queued");
+      setProcessing("running");
+    } catch (error) {
+      if (error.status === 409) {
+        // Job already started (or completed) on the backend — resume polling.
+        setProcessingStage(null);
+        setProcessing("running");
+        return;
+      }
+      setProcessingErrorCode("START_FAILED");
+      setProcessingError(error.message || "Failed to start processing.");
+      setProcessing("failed");
+    }
+  };
+
+  // Client-side failures (network, transcript fetch) only need re-polling;
+  // backend-side failures are restarted through POST /process.
+  const CLIENT_SIDE_ERROR_CODES = ["NETWORK", "TRANSCRIPT_FETCH", "TIMEOUT"];
+  const handleRetryProcessing = () => {
+    if (CLIENT_SIDE_ERROR_CODES.includes(processingErrorCode)) {
+      setProcessingError("");
+      setProcessingErrorCode(null);
+      setProcessing("running");
+    } else {
+      handleStartProcessing();
+    }
+  };
+
+  const showStartButton = uploadedVideo && processing === "idle";
+  const showTranscript = processing === "completed" && transcript;
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -71,10 +210,27 @@ export function Home() {
                 jobId={uploadedVideo?.job_id}
                 isSuccess={!!uploadedVideo}
                 isError={isError}
-                errorMessage={errorMessage}
+                errorMessage={processing === "failed" ? processingError : errorMessage}
+                processingStatus={processing === "idle" ? null : processing}
+                processingStage={processingStage}
+                processingErrorCode={processingErrorCode}
               />
             </div>
           )}
+
+          {/* Processing retry (not offered when ASR is simply not configured) */}
+          {processing === "failed" &&
+            processingErrorCode !== "ASR_NOT_CONFIGURED" &&
+            processingError && (
+              <div className="flex justify-center">
+                <button
+                  onClick={handleRetryProcessing}
+                  className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition"
+                >
+                  Retry Processing
+                </button>
+              </div>
+            )}
 
           {/* Video preview */}
           {uploadedVideo && (
@@ -85,6 +241,28 @@ export function Home() {
                   filename={uploadedVideo.filename}
                 />
               </div>
+
+              {/* Start processing */}
+              {showStartButton && (
+                <div className="flex justify-center">
+                  <button
+                    onClick={handleStartProcessing}
+                    className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition"
+                  >
+                    Start Processing
+                  </button>
+                </div>
+              )}
+
+              {/* Transcript panel */}
+              {showTranscript && (
+                <div className="flex justify-center">
+                  <TranscriptPanel
+                    jobId={uploadedVideo.job_id}
+                    segments={transcript}
+                  />
+                </div>
+              )}
 
               {/* Reset button */}
               <div className="flex justify-center">

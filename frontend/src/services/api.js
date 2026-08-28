@@ -36,4 +36,54 @@ export const api = {
   getVideoUrl(jobId) {
     return `${API_BASE_URL}/api/videos/${jobId}/file`;
   },
+
+  /**
+   * Start Phase 2 processing (audio extraction + transcription) for a job
+   */
+  async startProcessing(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/process`,
+      { method: "POST" }
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to start processing");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Get processing status for a job
+   */
+  async getJobStatus(jobId) {
+    const response = await fetch(`${API_BASE_URL}/api/videos/${jobId}/status`);
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to fetch job status");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Get the timestamped transcript for a completed job
+   */
+  async getTranscript(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/transcript`
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to fetch transcript");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
 };
