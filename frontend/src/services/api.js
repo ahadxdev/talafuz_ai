@@ -86,4 +86,44 @@ export const api = {
     }
     return data;
   },
+
+  /**
+   * Phase 3 — generate Romanized subtitles from the ASR transcript.
+   * English translation is optional and generated separately.
+   */
+  async romanize(jobId, includeEnglish = false) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/romanize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ include_english: includeEnglish }),
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to generate subtitles");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Phase 3 — fetch previously generated romanized subtitles for a job
+   */
+  async getSubtitles(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/subtitles`
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to fetch subtitles");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
 };

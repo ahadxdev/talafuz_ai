@@ -5,6 +5,15 @@ const PIPELINE_STEPS = [
   { key: "completed", label: "Transcript ready" },
 ];
 
+// Phase 3 extends the pipeline with romanization and subtitle generation.
+const FULL_PIPELINE_STEPS = [
+  { key: "video", label: "Video uploaded" },
+  { key: "extracting_audio", label: "Extracting audio" },
+  { key: "transcribing", label: "Transcribing" },
+  { key: "romanizing", label: "Romanizing" },
+  { key: "subtitles_ready", label: "Subtitles ready" },
+];
+
 function stepState(stepKey, processingStatus) {
   if (processingStatus === "extracting_audio") {
     return stepKey === "video" ? "done" : stepKey === "extracting_audio" ? "active" : "pending";
@@ -16,7 +25,21 @@ function stepState(stepKey, processingStatus) {
       ? "active"
       : "pending";
   }
-  if (processingStatus === "completed") return "done";
+  if (processingStatus === "romanizing") {
+    return stepKey === "romanizing"
+      ? "active"
+      : stepKey === "subtitles_ready"
+      ? "pending"
+      : "done";
+  }
+  if (processingStatus === "subtitles_ready") return "done";
+  if (processingStatus === "completed") {
+    // In the full (Phase 3) stepper "Transcript ready" maps to the
+    // romanizing boundary: ASR steps done, romanization not started yet.
+    return stepKey === "romanizing" || stepKey === "subtitles_ready"
+      ? "pending"
+      : "done";
+  }
   return "pending"; // queued / starting
 }
 
@@ -28,7 +51,13 @@ export function ProcessingStatus({
   processingStatus,
   processingStage,
   processingErrorCode,
+  phase3Status,
 }) {
+  // phase3Status: null (not started) | "romanizing" | "subtitles_ready"
+  const steps =
+    phase3Status === "subtitles_ready" || phase3Status === "romanizing"
+      ? FULL_PIPELINE_STEPS
+      : PIPELINE_STEPS;
   // Processing pipeline states take priority over the upload banner.
   if (processingStatus === "failed") {
     const asrMissing = processingErrorCode === "ASR_NOT_CONFIGURED";
@@ -66,18 +95,29 @@ export function ProcessingStatus({
   if (isPipelineActive) {
     const backendStatus =
       processingStatus === "completed"
-        ? "completed"
+        ? phase3Status === "subtitles_ready"
+          ? "subtitles_ready"
+          : phase3Status === "romanizing"
+          ? "romanizing"
+          : "completed"
         : processingStatus === "running"
         ? processingStage || "queued"
         : "queued";
 
+    const heading =
+      backendStatus === "subtitles_ready"
+        ? "Subtitles ready"
+        : backendStatus === "romanizing"
+        ? "Generating subtitles…"
+        : backendStatus === "completed"
+        ? "Transcript ready"
+        : "Processing video…";
+
     return (
       <div className="w-full max-w-2xl bg-gray-800 border border-gray-700 rounded-lg p-4">
-        <p className="text-white font-medium mb-3">
-          {processingStatus === "completed" ? "Transcript ready" : "Processing video…"}
-        </p>
+        <p className="text-white font-medium mb-3">{heading}</p>
         <ol className="space-y-2">
-          {PIPELINE_STEPS.map((step) => {
+          {steps.map((step) => {
             const state = stepState(step.key, backendStatus);
             return (
               <li key={step.key} className="flex items-center gap-3">

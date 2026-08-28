@@ -1,10 +1,16 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { api } from "../services/api";
 
 export function VideoUploader({ onVideoSelect, onUploadStart, onUploadComplete, onError }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const fileInputRef = useRef(null);
+
+  // Open the native file picker explicitly. (A <button> nested inside a
+  // <label> swallows the click instead of activating the hidden input, so
+  // the trigger is driven from a ref.)
+  const openFilePicker = () => fileInputRef.current?.click();
 
   const handleFileSelect = (file) => {
     if (file) {
@@ -29,6 +35,9 @@ export function VideoUploader({ onVideoSelect, onUploadStart, onUploadComplete, 
   const handleFileInputChange = (e) => {
     const file = e.target.files?.[0];
     handleFileSelect(file);
+    // Reset so choosing the same file again (e.g. after removing it)
+    // still fires onChange.
+    e.target.value = "";
   };
 
   const handleRemoveFile = () => {
@@ -68,46 +77,56 @@ export function VideoUploader({ onVideoSelect, onUploadStart, onUploadComplete, 
 
   return (
     <div className="w-full max-w-2xl">
+      {/* Hidden file input, driven via ref from the drop zone below */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm"
+        onChange={handleFileInputChange}
+        className="hidden"
+      />
       {!selectedFile ? (
         <div
           onDragOver={handleDragOver}
           onDrop={handleDrop}
+          onClick={openFilePicker}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              openFilePicker();
+            }
+          }}
+          role="button"
+          tabIndex={0}
           className="border-2 border-dashed border-gray-600 rounded-lg p-12 text-center hover:border-gray-500 transition cursor-pointer"
         >
-          <label className="cursor-pointer">
-            <div className="text-gray-400 mb-4">
-              <svg
-                className="w-16 h-16 mx-auto mb-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={1.5}
-                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8m0 8l-6-4m6 4l6-4"
-                />
-              </svg>
-            </div>
-            <p className="text-gray-300 text-lg mb-2">Drag & drop your video here</p>
-            <p className="text-gray-500 text-sm">or</p>
-            <button
-              type="button"
-              className="mt-3 px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition"
+          <div className="text-gray-400 mb-4">
+            <svg
+              className="w-16 h-16 mx-auto mb-4"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
             >
-              Choose Video
-            </button>
-            <p className="text-gray-500 text-xs mt-3">
-              Supported: MP4, MOV, WEBM
-            </p>
-            <input
-              type="file"
-              accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm"
-              onChange={handleFileInputChange}
-              className="hidden"
-            />
-          </label>
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.5}
+                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8m0 8l-6-4m6 4l6-4"
+              />
+            </svg>
+          </div>
+          <p className="text-gray-300 text-lg mb-2">Drag & drop your video here</p>
+          <p className="text-gray-500 text-sm">or</p>
+          <button
+            type="button"
+            onClick={openFilePicker}
+            className="mt-3 px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition"
+          >
+            Choose Video
+          </button>
+          <p className="text-gray-500 text-xs mt-3">
+            Supported: MP4, MOV, WEBM
+          </p>
         </div>
       ) : (
         <div className="space-y-4">

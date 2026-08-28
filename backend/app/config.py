@@ -81,6 +81,25 @@ ASR_HTTP_TIMEOUT = int(os.getenv("ASR_HTTP_TIMEOUT", "120"))  # seconds per HTTP
 # Sync qwen3-asr-flash accepts base64 audio up to 10 MB encoded
 ASR_SYNC_MAX_AUDIO_BYTES = 7 * 1024 * 1024  # stay safely under the 10 MB limit
 
+# ---------------------------------------------------------------------------
+# Phase 3 — Romanization / English translation (Qwen text model)
+#
+# Uses the SAME Model Studio API key (DASHSCOPE_API_KEY) and region as the
+# ASR integration, but a Qwen TEXT model through the official
+# OpenAI-compatible chat/completions endpoint (compatible-mode/v1).
+# Qwen3-ASR is NOT used here — ASR already happened in Phase 2.
+# ---------------------------------------------------------------------------
+# Official Model Studio text models: qwen-flash, qwen-turbo, qwen-plus, qwen-max
+ROMANIZATION_MODEL = os.getenv("ROMANIZATION_MODEL", "qwen-plus").strip()
+# Transcript segments are sent to the model in batches of this size
+ROMANIZATION_BATCH_SIZE = int(os.getenv("ROMANIZATION_BATCH_SIZE", "8"))
+ROMANIZATION_HTTP_TIMEOUT = int(os.getenv("ROMANIZATION_HTTP_TIMEOUT", "180"))  # seconds per call
+ROMANIZATION_MAX_TOKENS = int(os.getenv("ROMANIZATION_MAX_TOKENS", "8192"))
+# Subtitle segmentation targets (Phase 3)
+SUBTITLE_MAX_CHARS_PER_LINE = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", "42"))
+SUBTITLE_MAX_LINES = int(os.getenv("SUBTITLE_MAX_LINES", "2"))
+SUBTITLE_MIN_DURATION = float(os.getenv("SUBTITLE_MIN_DURATION", "0.8"))  # seconds
+
 # Legacy Alibaba Cloud access-key variables — kept for reference only;
 # NOT used by the Model Studio Qwen3-ASR integration.
 ALIBABA_CLOUD_ACCESS_KEY_ID = os.getenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "")

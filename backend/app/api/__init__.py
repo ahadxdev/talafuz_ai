@@ -8,12 +8,23 @@ from ..services import VideoService
 from ..services.pipeline import run_processing_job
 from ..services.job_manager import job_manager, resolve_job_state
 from ..services.asr_service import load_transcript, get_asr_provider, ASRNotConfiguredError
+from ..services.romanization_service import (
+    QwenRomanizationService,
+    RomanizationError,
+    RomanizationNotConfiguredError,
+    ROMANIZED_SUBTITLES_FILENAME,
+    load_romanized_subtitles,
+    save_romanized_subtitles,
+)
 from ..config import JOBS_DIR
 from ..models import (
     VideoUploadResponse,
     ProcessResponse,
     JobStatusResponse,
     TranscriptResponse,
+    RomanizeRequest,
+    RomanizeResponse,
+    RomanizedSubtitle,
 )
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -156,7 +167,11 @@ async def get_status(job_id: str):
     if state is None:
         raise HTTPException(status_code=404, detail="Unknown job ID.")
 
-    return JobStatusResponse(job_id=job_id, **state)
+    return JobStatusResponse(
+        job_id=job_id,
+        subtitles_available=(JOBS_DIR / job_id / ROMANIZED_SUBTITLES_FILENAME).exists(),
+        **state,
+    )
 
 
 @router.get("/{job_id}/transcript", response_model=TranscriptResponse)
@@ -192,3 +207,83 @@ async def get_transcript(job_id: str):
         raise HTTPException(status_code=404, detail="Transcript not available for this job.")
 
     return TranscriptResponse(job_id=job_id, segments=data["segments"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Romanization + optional English translation endpoints
+# ---------------------------------------------------------------------------
+
+def _run_romanization(job_id: str, segments, include_english: bool) -> dict:
+    """Blocking romanization work — always runs in a worker thread."""
+    service = QwenRomanizationService()
+    subtitles = service.romanize_segments(segments, include_english=include_english)
+    save_romanized_subtitles(
+        JOBS_DIR / job_id, job_id, subtitles,
+        model=service._model,
+        include_english=include_english,
+    )
+    return {
+        "job_id": job_id,
+        "model": service._model,
+        "include_english": include_english,
+        "subtitles": [RomanizedSubtitle(**s.to_dict()) for s in subtitles],
+    }
+
+
+@router.post("/{job_id}/romanize", response_model=RomanizeResponse)
+async def romanize_transcript(job_id: str, body: RomanizeRequest = RomanizeRequest()):
+    """
+    Generate Romanized subtitles (Latin-script Roman Urdu/Hindi) from the
+    existing ASR transcript of a completed job. English translation is
+    optional and generated separately.
+
+    The original transcript.json is never modified.
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    transcript = load_transcript(job_dir)
+    if transcript is None or not transcript.get("segments"):
+        raise HTTPException(
+            status_code=_CONFLICT,
+            detail="No transcript available. Run processing first to "
+            "generate the ASR transcript.",
+        )
+
+    # Fail fast on missing configuration before doing any work.
+    try:
+        QwenRomanizationService()
+    except RomanizationNotConfiguredError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _run_romanization, job_id, transcript["segments"],
+            body.include_english,
+        )
+    except RomanizationError as e:
+        logger.error("Romanization failed for job %s: %s", job_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
+    return RomanizeResponse(**result)
+
+
+@router.get("/{job_id}/subtitles", response_model=RomanizeResponse)
+async def get_subtitles(job_id: str):
+    """Return previously generated romanized subtitles for a job."""
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    data = load_romanized_subtitles(job_dir)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Romanized subtitles have not been generated for this job yet.",
+        )
+    return RomanizeResponse(
+        job_id=data.get("job_id", job_id),
+        model=data.get("model", ""),
+        include_english=bool(data.get("include_english", False)),
+        subtitles=[RomanizedSubtitle(**s) for s in data["subtitles"]],
+    )

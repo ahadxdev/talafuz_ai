@@ -3,6 +3,7 @@ import { VideoUploader } from "../components/VideoUploader";
 import { VideoPreview } from "../components/VideoPreview";
 import { ProcessingStatus } from "../components/ProcessingStatus";
 import { TranscriptPanel } from "../components/TranscriptPanel";
+import { SubtitlePanel } from "../components/SubtitlePanel";
 import { api } from "../services/api";
 
 const STATUS_POLL_INTERVAL_MS = 1500;
@@ -22,6 +23,14 @@ export function Home() {
   const [processingError, setProcessingError] = useState("");
   const [transcript, setTranscript] = useState(null);
   const pollStopRef = useRef(() => {});
+
+  // Phase 3 — romanized subtitles state
+  const [subtitles, setSubtitles] = useState(null);
+  const [subtitlesModel, setSubtitlesModel] = useState(null);
+  const [romanization, setRomanization] = useState("idle"); // idle | running | done | failed
+  const [romanError, setRomanError] = useState("");
+  const [includeEnglish, setIncludeEnglish] = useState(false);
+  const [showEnglish, setShowEnglish] = useState(false);
 
   const stopPolling = useCallback(() => {
     pollStopRef.current();
@@ -46,6 +55,15 @@ export function Home() {
     setProcessingErrorCode(null);
     setProcessingError("");
     setTranscript(null);
+    resetPhase3();
+  };
+
+  const resetPhase3 = () => {
+    setSubtitles(null);
+    setSubtitlesModel(null);
+    setRomanization("idle");
+    setRomanError("");
+    setShowEnglish(false);
   };
 
   const handleError = (message) => {
@@ -65,6 +83,7 @@ export function Home() {
     setProcessingErrorCode(null);
     setProcessingError("");
     setTranscript(null);
+    resetPhase3();
   };
 
   // Poll GET /status until the job completes, fails, or times out.
@@ -89,6 +108,20 @@ export function Home() {
             setTranscript(data.segments ?? []);
             setProcessingStage("completed");
             setProcessing("completed");
+            // Restore previously generated subtitles, if any. The status
+            // endpoint reports subtitles_available, so no 404 probe is made.
+            if (status.subtitles_available) {
+              try {
+                const subs = await api.getSubtitles(uploadedVideo.job_id);
+                if (cancelled) return;
+                setSubtitles(subs.subtitles ?? []);
+                setSubtitlesModel(subs.model ?? null);
+                setShowEnglish(!!subs.include_english);
+                setRomanization("done");
+              } catch {
+                // Subtitles vanished between checks — safe to ignore.
+              }
+            }
           } catch (err) {
             if (cancelled) return;
             setProcessingErrorCode("TRANSCRIPT_FETCH");
@@ -176,6 +209,32 @@ export function Home() {
   const showStartButton = uploadedVideo && processing === "idle";
   const showTranscript = processing === "completed" && transcript;
 
+  // Phase 3 — generate Romanized subtitles from the completed ASR transcript.
+  const handleRomanize = async () => {
+    if (!uploadedVideo?.job_id) return;
+    setRomanization("running");
+    setRomanError("");
+    setSubtitles(null);
+    try {
+      const data = await api.romanize(uploadedVideo.job_id, includeEnglish);
+      setSubtitles(data.subtitles ?? []);
+      setSubtitlesModel(data.model ?? null);
+      setShowEnglish(!!data.include_english);
+      setRomanization("done");
+    } catch (error) {
+      setRomanError(error.message || "Failed to generate subtitles.");
+      setRomanization("failed");
+    }
+  };
+
+  const phase3Status =
+    romanization === "running"
+      ? "romanizing"
+      : romanization === "done" && subtitles
+      ? "subtitles_ready"
+      : null;
+  const hasEnglish = (subtitles || []).some((s) => s.english_text);
+
   return (
     <div className="min-h-screen bg-gray-900 text-white">
       {/* Header */}
@@ -214,6 +273,7 @@ export function Home() {
                 processingStatus={processing === "idle" ? null : processing}
                 processingStage={processingStage}
                 processingErrorCode={processingErrorCode}
+                phase3Status={phase3Status}
               />
             </div>
           )}
@@ -262,6 +322,64 @@ export function Home() {
                     segments={transcript}
                   />
                 </div>
+              )}
+
+              {/* Phase 3 — romanization controls */}
+              {showTranscript && romanization !== "running" && (
+                <div className="flex flex-col items-center gap-3">
+                  <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={includeEnglish}
+                      onChange={(e) => setIncludeEnglish(e.target.checked)}
+                      className="w-4 h-4 accent-blue-500"
+                    />
+                    Include English translation (optional)
+                  </label>
+                  <button
+                    onClick={handleRomanize}
+                    className="px-8 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition"
+                  >
+                    {romanization === "done"
+                      ? "Regenerate Roman Urdu Subtitles"
+                      : "Generate Roman Urdu Subtitles"}
+                  </button>
+                </div>
+              )}
+
+              {/* Phase 3 — romanization error */}
+              {romanization === "failed" && romanError && (
+                <div className="flex justify-center">
+                  <div className="w-full max-w-2xl bg-red-900 border border-red-700 rounded-lg p-4">
+                    <p className="text-red-200 font-medium">
+                      Subtitle generation failed
+                    </p>
+                    <p className="text-red-300 text-sm mt-1">{romanError}</p>
+                    <button
+                      onClick={handleRomanize}
+                      className="mt-3 px-4 py-1.5 bg-red-700 hover:bg-red-600 text-white text-sm font-medium rounded transition"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Phase 3 — romanized subtitles (primary output) */}
+              {showTranscript && subtitles && romanization === "done" && (
+                <div className="flex justify-center">
+                  <SubtitlePanel
+                    subtitles={subtitles}
+                    hasEnglish={hasEnglish}
+                    showEnglish={showEnglish}
+                    onToggleEnglish={setShowEnglish}
+                  />
+                </div>
+              )}
+              {subtitlesModel && (
+                <p className="text-center text-xs text-gray-500">
+                  Romanization model: {subtitlesModel}
+                </p>
               )}
 
               {/* Reset button */}
