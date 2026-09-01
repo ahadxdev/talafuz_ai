@@ -1,8 +1,17 @@
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Home } from "./pages/Home";
+import { EditorPage } from "./pages/EditorPage";
 import "./App.css";
 
 function App() {
-  return <Home />;
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/editor/:jobId" element={<EditorPage />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
 
 export default App;

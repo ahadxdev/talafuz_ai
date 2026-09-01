@@ -126,4 +126,54 @@ export const api = {
     }
     return data;
   },
+
+  /**
+   * Phase 4 — save edited subtitles for a job
+   */
+  async saveSubtitles(jobId, subtitles) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/subtitles/save`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subtitles }),
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to save subtitles");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Phase 4 — export subtitles as SRT file
+   */
+  async exportSRT(jobId, mode = "romanized") {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/export/srt?mode=${encodeURIComponent(mode)}`
+    );
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const error = new Error(data.detail || "Failed to export SRT");
+      error.status = response.status;
+      throw error;
+    }
+
+    // Get the file blob and trigger download
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `subtitles_${mode}_${jobId}.srt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  },
 };
+

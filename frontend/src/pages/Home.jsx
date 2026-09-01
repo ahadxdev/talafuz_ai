@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import { VideoUploader } from "../components/VideoUploader";
 import { VideoPreview } from "../components/VideoPreview";
 import { ProcessingStatus } from "../components/ProcessingStatus";
@@ -11,6 +12,7 @@ const STATUS_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CONSECUTIVE_POLL_ERRORS = 3;
 
 export function Home() {
+  const navigate = useNavigate();
   const [uploadedVideo, setUploadedVideo] = useState(null);
   const [isError, setIsError] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
@@ -380,6 +382,18 @@ export function Home() {
                 <p className="text-center text-xs text-gray-500">
                   Romanization model: {subtitlesModel}
                 </p>
+              )}
+
+              {/* Phase 4 — Enter editor */}
+              {showTranscript && subtitles && romanization === "done" && (
+                <div className="flex justify-center">
+                  <button
+                    onClick={() => navigate(`/editor/${uploadedVideo.job_id}`)}
+                    className="px-8 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
+                  >
+                    Edit Subtitles & Export
+                  </button>
+                </div>
               )}
 
               {/* Reset button */}

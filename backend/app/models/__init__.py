@@ -68,3 +68,29 @@ class RomanizeResponse(BaseModel):
     model: str
     include_english: bool
     subtitles: List[RomanizedSubtitle]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Subtitle editor & export models
+# ---------------------------------------------------------------------------
+
+class EditedSubtitle(BaseModel):
+    """A subtitle that has been edited by the user."""
+    id: int
+    start: float                 # seconds (user-editable)
+    end: float                   # seconds (user-editable)
+    original_text: str           # original ASR text, never changed
+    romanized_text: str          # user-editable romanized text
+    english_text: Optional[str] = None  # user-editable English text
+
+
+class SubtitleSaveRequest(BaseModel):
+    """Request to save edited subtitles."""
+    subtitles: List[EditedSubtitle]
+
+
+class SubtitleSaveResponse(BaseModel):
+    """Confirmation response after saving edited subtitles."""
+    job_id: str
+    message: str
+    subtitles_saved: int

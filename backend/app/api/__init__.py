@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 from functools import partial
+from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from ..services import VideoService
 from ..services.pipeline import run_processing_job
@@ -16,6 +18,7 @@ from ..services.romanization_service import (
     load_romanized_subtitles,
     save_romanized_subtitles,
 )
+from ..services.srt_service import generate_srt
 from ..config import JOBS_DIR
 from ..models import (
     VideoUploadResponse,
@@ -25,6 +28,9 @@ from ..models import (
     RomanizeRequest,
     RomanizeResponse,
     RomanizedSubtitle,
+    EditedSubtitle,
+    SubtitleSaveRequest,
+    SubtitleSaveResponse,
 )
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -287,3 +293,162 @@ async def get_subtitles(job_id: str):
         include_english=bool(data.get("include_english", False)),
         subtitles=[RomanizedSubtitle(**s) for s in data["subtitles"]],
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Subtitle editor endpoints
+# ---------------------------------------------------------------------------
+
+EDITED_SUBTITLES_FILENAME = "subtitles.json"
+
+
+@router.post("/{job_id}/subtitles/save", response_model=SubtitleSaveResponse)
+async def save_edited_subtitles(job_id: str, request: SubtitleSaveRequest):
+    """
+    Save user-edited subtitles to a separate file (subtitles.json).
+    
+    The edited subtitles are stored separately from the original romanized
+    output (romanized_subtitles.json), preserving the original generated
+    data.
+    
+    Validation:
+    - start >= 0
+    - end > start
+    - timestamps must be numeric
+    - subtitle text cannot be empty
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    # Validate subtitles before saving
+    if not request.subtitles:
+        raise HTTPException(status_code=400, detail="No subtitles provided.")
+
+    for sub in request.subtitles:
+        if not isinstance(sub.start, (int, float)) or not isinstance(sub.end, (int, float)):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subtitle {sub.id}: start and end must be numeric.",
+            )
+        if sub.start < 0 or sub.end < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subtitle {sub.id}: timestamps cannot be negative.",
+            )
+        if sub.start >= sub.end:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subtitle {sub.id}: start must be before end.",
+            )
+        if not sub.romanized_text or not sub.romanized_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Subtitle {sub.id}: romanized_text cannot be empty.",
+            )
+
+    # Ensure directory exists
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save to subtitles.json
+    subtitles_path = job_dir / EDITED_SUBTITLES_FILENAME
+    data = {
+        "job_id": job_id,
+        "subtitles": [
+            {
+                "id": sub.id,
+                "start": round(sub.start, 3),
+                "end": round(sub.end, 3),
+                "original_text": sub.original_text,
+                "romanized_text": sub.romanized_text,
+                "english_text": sub.english_text,
+            }
+            for sub in request.subtitles
+        ],
+    }
+
+    with open(subtitles_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    logger.info("Saved edited subtitles for job %s to %s", job_id, subtitles_path)
+
+    return SubtitleSaveResponse(
+        job_id=job_id,
+        message="Subtitles saved successfully.",
+        subtitles_saved=len(request.subtitles),
+    )
+
+
+@router.get("/{job_id}/export/srt")
+async def export_srt(
+    job_id: str,
+    mode: str = Query("romanized", regex="^(romanized|english|dual)$"),
+):
+    """
+    Export subtitles as SRT file.
+
+    Args:
+        job_id: The job identifier.
+        mode: Display mode for SRT:
+            - "romanized": romanized text only
+            - "english": English text only
+            - "dual": romanized text followed by English text
+
+    Returns:
+        SRT file as downloadable response.
+
+    Raises:
+        400: Invalid mode or subtitle data issues.
+        404: Job not found or no subtitles available.
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    # Try to load edited subtitles first; fall back to romanized_subtitles
+    subtitles_path = job_dir / EDITED_SUBTITLES_FILENAME
+    romanized_path = job_dir / ROMANIZED_SUBTITLES_FILENAME
+
+    data = None
+    if subtitles_path.exists():
+        try:
+            with open(subtitles_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error("Failed to load edited subtitles for job %s: %s", job_id, e)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to load edited subtitles.",
+            )
+    elif romanized_path.exists():
+        try:
+            with open(romanized_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error("Failed to load romanized subtitles for job %s: %s", job_id, e)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to load romanized subtitles.",
+            )
+
+    if not data or not data.get("subtitles"):
+        raise HTTPException(
+            status_code=404,
+            detail="No subtitles available for this job. Generate subtitles first.",
+        )
+
+    # Generate SRT
+    try:
+        srt_content = generate_srt(data["subtitles"], mode=mode)
+    except ValueError as e:
+        logger.warning("SRT generation failed for job %s (mode=%s): %s", job_id, mode, e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Return as downloadable file
+    return FileResponse(
+        content=srt_content.encode("utf-8"),
+        media_type="text/plain; charset=utf-8",
+        filename=f"subtitles_{mode}_{job_id}.srt",
+        headers={"Content-Disposition": f'attachment; filename="subtitles_{mode}_{job_id}.srt"'},
+    )
+

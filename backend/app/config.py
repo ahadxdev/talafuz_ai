@@ -5,12 +5,15 @@ from dotenv import load_dotenv
 
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
+# The project root contains backend, frontend, and the root .env file.
 ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 JOBS_DIR = DATA_DIR / "jobs"
 
-# Load environment variables from the project root .env (if present)
-load_dotenv(ROOT_DIR / ".env")
+# Load environment variables from the project root .env (preferred), while
+# keeping a backward-compatible fallback for backend-local .env files.
+for env_path in (ROOT_DIR / ".env", BASE_DIR / ".env"):
+	load_dotenv(env_path)
 
 # Ensure directories exist
 DATA_DIR.mkdir(exist_ok=True)
