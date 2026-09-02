@@ -1,259 +1,738 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { VideoPlayer } from "../components/VideoPlayer";
-import { SubtitleEditor } from "../components/SubtitleEditor";
-import { SubtitleModeSelector } from "../components/SubtitleModeSelector";
+import { VideoStage } from "../components/editor/VideoStage";
+import { SubtitleList } from "../components/editor/SubtitleList";
+import { Timeline } from "../components/editor/Timeline";
+import { StylePanel } from "../components/editor/StylePanel";
+import {
+  IconArrowLeft,
+  IconDownload,
+  IconRedo,
+  IconSave,
+  IconUndo,
+} from "../components/editor/icons";
+import "../components/editor/editor.css";
+import { useEditorHistory } from "../hooks/useEditorHistory";
 import { api } from "../services/api";
+import { DEFAULT_CAPTION_STYLE, mergeCaptionStyle } from "../utils/captionStyles";
+import {
+  LANGUAGES,
+  createSubtitleAfter,
+  findActiveSubtitle,
+  hasEnglishTranslations,
+  mergeSubtitles,
+  resequenceSubtitles,
+  searchSubtitles,
+  splitSubtitleAt,
+  validateSubtitlesForSave,
+} from "../utils/subtitleUtils";
 
 /**
- * Phase 4 — Subtitle Editor Page
+ * Phase 4 — Talafuz AI Subtitle Editor.
  *
- * Provides a professional creator-focused workspace for editing and exporting subtitles.
+ * Three-panel creator workspace:
+ *   left   — caption list (search, inline editing, add/split/merge/delete)
+ *   center — video preview with styled caption overlay + timeline
+ *   right  — caption tools (text, style, position, animation)
+ *
+ * Undo/redo covers the whole editor document (subtitles + language + style).
+ * Editor state autosaves to localStorage (`talafuz_editor_{job_id}`) so a
+ * page refresh never loses work; "Save" persists to the backend.
  */
+
+const DRAFT_PREFIX = "talafuz_editor_";
+const DRAFT_DEBOUNCE_MS = 400;
+const TOAST_TIMEOUT_MS = 3500;
+
+function loadDraft(jobId) {
+  try {
+    const raw = localStorage.getItem(DRAFT_PREFIX + jobId);
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    if (draft && Array.isArray(draft.subtitles) && draft.subtitles.length > 0) {
+      return draft;
+    }
+  } catch {
+    /* corrupted draft — fall through to server data */
+  }
+  return null;
+}
+
 export function EditorPage() {
   const navigate = useNavigate();
   const { jobId } = useParams();
+  const playerRef = useRef(null);
+  const interactionRef = useRef(false);
 
-  // State
-  const [videoUrl, setVideoUrl] = useState("");
-  const [subtitles, setSubtitles] = useState([]);
-  const [originalSubtitles, setOriginalSubtitles] = useState([]);
-  const [subtitleMode, setSubtitleMode] = useState("romanized");
-  const [activeSubtitleId, setActiveSubtitleId] = useState(null);
-  const [hasEnglish, setHasEnglish] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
-  const [message, setMessage] = useState("");
-  const [error, setError] = useState("");
-  const videoPlayerRef = useRef(null);
+  const [status, setStatus] = useState("loading"); // loading | ready | error
+  const [loadError, setLoadError] = useState("");
+  const [hasLocalDraft, setHasLocalDraft] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [selectedId, setSelectedId] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showSafeZone, setShowSafeZone] = useState(false);
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved
+  const [exportState, setExportState] = useState("idle"); // idle | exporting | downloading
+  const [toast, setToast] = useState(null);
 
-  // Load subtitles on mount
+  const editor = useEditorHistory({
+    subtitles: [],
+    language: "romanized",
+    style: DEFAULT_CAPTION_STYLE,
+  });
+  const {
+    state: { subtitles, language, style },
+    update,
+    pushHistory,
+    updateLive,
+    undo,
+    redo,
+    reset,
+    canUndo,
+    canRedo,
+  } = editor;
+
+  // ------------------------------------------------------------------
+  // Load: local draft first, then the backend (edited → generated)
+  // ------------------------------------------------------------------
   useEffect(() => {
-    if (!jobId) {
-      setError("No job ID provided");
-      return;
+    let cancelled = false;
+    setStatus("loading");
+    setLoadError("");
+
+    const draft = loadDraft(jobId);
+    if (draft) {
+      reset({
+        subtitles: draft.subtitles,
+        language: draft.language || "romanized",
+        style: mergeCaptionStyle(draft.style),
+      });
+      setHasLocalDraft(true);
+      setStatus("ready");
+      return undefined;
     }
 
-    const loadSubtitles = async () => {
+    (async () => {
       try {
-        setError("");
-        setMessage("Loading subtitles...");
-
-        // Load subtitles
         const data = await api.getSubtitles(jobId);
-        const subs = data.subtitles || [];
-        setSubtitles(subs);
-        setOriginalSubtitles(JSON.parse(JSON.stringify(subs))); // Deep copy
-
-        // Check for English
-        const hasEng = subs.some((s) => s.english_text);
-        setHasEnglish(hasEng);
-
-        // Set video URL
-        const url = api.getVideoUrl(jobId);
-        setVideoUrl(url);
-
-        setMessage("");
+        if (cancelled) return;
+        reset({
+          subtitles: data.subtitles || [],
+          language: data.language || "romanized",
+          style: mergeCaptionStyle(data.style),
+        });
+        setStatus("ready");
       } catch (err) {
-        setError(err.message || "Failed to load subtitles");
+        if (cancelled) return;
+        setLoadError(
+          err.message ||
+            "Failed to load subtitles. Generate them on the home page first."
+        );
+        setStatus("error");
       }
+    })();
+
+    return () => {
+      cancelled = true;
     };
+  }, [jobId, reset]);
 
-    loadSubtitles();
-  }, [jobId]);
+  // ------------------------------------------------------------------
+  // Autosave to localStorage (debounced)
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (status !== "ready" || subtitles.length === 0) return undefined;
+    const id = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          DRAFT_PREFIX + jobId,
+          JSON.stringify({
+            version: 1,
+            subtitles,
+            language,
+            style,
+            savedAt: Date.now(),
+          })
+        );
+        setHasLocalDraft(true);
+      } catch {
+        /* storage unavailable — autosave silently skipped */
+      }
+    }, DRAFT_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [status, jobId, subtitles, language, style]);
 
-  const handleEditSubtitle = useCallback((editedSubtitle) => {
-    setSubtitles((prev) =>
-      prev.map((sub) => (sub.id === editedSubtitle.id ? editedSubtitle : sub))
-    );
+  // ------------------------------------------------------------------
+  // Derived state
+  // ------------------------------------------------------------------
+  const activeSubtitle = useMemo(
+    () => findActiveSubtitle(subtitles, currentTime),
+    [subtitles, currentTime]
+  );
+  const selectedSubtitle = useMemo(
+    () => subtitles.find((s) => s.id === selectedId) || null,
+    [subtitles, selectedId]
+  );
+  const hasEnglish = useMemo(
+    () => hasEnglishTranslations(subtitles),
+    [subtitles]
+  );
+  const matchIds = useMemo(
+    () => searchSubtitles(subtitles, searchQuery),
+    [subtitles, searchQuery]
+  );
+
+  const selectedIndex = subtitles.findIndex((s) => s.id === selectedId);
+  const hasSelection = selectedId != null;
+  const canSplit =
+    !!selectedSubtitle &&
+    currentTime > selectedSubtitle.start + 0.05 &&
+    currentTime < selectedSubtitle.end - 0.05;
+  const canMerge = selectedIndex >= 0 && selectedIndex < subtitles.length - 1;
+
+  // ------------------------------------------------------------------
+  // Live interaction pattern: one undo entry per interaction (drag/typing)
+  // ------------------------------------------------------------------
+  const beginInteraction = useCallback(() => {
+    if (!interactionRef.current) {
+      pushHistory();
+      interactionRef.current = true;
+    }
+  }, [pushHistory]);
+
+  const endInteraction = useCallback(() => {
+    interactionRef.current = false;
   }, []);
 
-  const handleSubtitleClick = (subtitle) => {
-    setActiveSubtitleId(subtitle.id);
-  };
+  // ------------------------------------------------------------------
+  // Selection / playback
+  // ------------------------------------------------------------------
+  const handleSelect = useCallback((sub) => {
+    setSelectedId(sub.id);
+    playerRef.current?.seek(sub.start);
+    setCurrentTime(sub.start);
+  }, []);
 
-  const handleSeekTo = (time) => {
-    if (videoPlayerRef.current) {
-      videoPlayerRef.current.seek(time);
+  const handleSeek = useCallback((time) => {
+    playerRef.current?.seek(time);
+    setCurrentTime(time);
+  }, []);
+
+  const handleCurrentTime = useCallback((time) => setCurrentTime(time), []);
+  const handleDuration = useCallback((d) => setDuration(d), []);
+
+  // ------------------------------------------------------------------
+  // Structural operations (add / delete / split / merge)
+  // ------------------------------------------------------------------
+  const handleAdd = useCallback(() => {
+    const base = selectedSubtitle || subtitles[subtitles.length - 1] || null;
+    const effectiveDuration =
+      duration || (base ? base.end : 0) + 2;
+    const fresh = createSubtitleAfter(base, effectiveDuration);
+    update((doc) => {
+      const subs = [...doc.subtitles];
+      const insertAt = base
+        ? subs.findIndex((s) => s.id === base.id) + 1
+        : subs.length;
+      subs.splice(insertAt, 0, fresh);
+      return { ...doc, subtitles: resequenceSubtitles(subs) };
+    });
+    const newId = base ? selectedIndex + 2 : subtitles.length + 1;
+    setSelectedId(newId);
+    playerRef.current?.seek(fresh.start);
+    setCurrentTime(fresh.start);
+  }, [
+    selectedSubtitle,
+    subtitles,
+    duration,
+    selectedIndex,
+    update,
+  ]);
+
+  const handleDelete = useCallback(() => {
+    if (selectedId == null) return;
+    const idx = selectedIndex;
+    update((doc) => ({
+      ...doc,
+      subtitles: resequenceSubtitles(
+        doc.subtitles.filter((s) => s.id !== selectedId)
+      ),
+    }));
+    const remaining = subtitles.length - 1;
+    if (remaining === 0) {
+      setSelectedId(null);
+    } else {
+      const nextIndex = Math.min(idx, remaining - 1);
+      setSelectedId(subtitles[nextIndex]?.id ?? null);
     }
-  };
+  }, [selectedId, selectedIndex, subtitles, update]);
 
-  const handleSaveChanges = async () => {
-    if (!jobId || subtitles.length === 0) {
-      setError("No subtitles to save");
+  const handleSplit = useCallback(() => {
+    if (!canSplit || !selectedSubtitle) return;
+    update((doc) => {
+      const subs = [...doc.subtitles];
+      const idx = subs.findIndex((s) => s.id === selectedId);
+      const parts = splitSubtitleAt(subs[idx], currentTime);
+      if (!parts) return doc;
+      subs.splice(idx, 1, parts[0], parts[1]);
+      return { ...doc, subtitles: resequenceSubtitles(subs) };
+    });
+    setSelectedId(selectedId + 1); // the second half follows the split
+  }, [canSplit, selectedSubtitle, selectedId, currentTime, update]);
+
+  const handleMerge = useCallback(() => {
+    if (!canMerge) return;
+    update((doc) => {
+      const subs = [...doc.subtitles];
+      const idx = subs.findIndex((s) => s.id === selectedId);
+      const merged = mergeSubtitles(subs[idx], subs[idx + 1]);
+      if (!merged) return doc;
+      subs.splice(idx, 2, merged);
+      return { ...doc, subtitles: resequenceSubtitles(subs) };
+    });
+  }, [canMerge, selectedId, update]);
+
+  // ------------------------------------------------------------------
+  // Timeline trimming (live drag → single undo entry)
+  // ------------------------------------------------------------------
+  const handleTrim = useCallback(
+    (id, edge, time, phase) => {
+      if (phase === "start") beginInteraction();
+
+      const apply = (doc) => {
+        const subs = doc.subtitles;
+        const idx = subs.findIndex((s) => s.id === id);
+        if (idx === -1) return doc;
+        const sub = subs[idx];
+        const prevEnd = idx > 0 ? subs[idx - 1].end : 0;
+        const nextStart =
+          idx < subs.length - 1 ? subs[idx + 1].start : Infinity;
+
+        let { start, end } = sub;
+        if (edge === "start") {
+          const candidate = Math.max(0, Math.min(time, sub.end - 0.1));
+          if (candidate >= prevEnd - 0.001 && candidate < sub.end - 0.05) {
+            start = candidate;
+          }
+        } else {
+          const candidate = Math.max(time, sub.start + 0.1);
+          if (candidate <= nextStart + 0.001 && candidate > sub.start + 0.05) {
+            end = candidate;
+          }
+        }
+
+        if (start === sub.start && end === sub.end) return doc;
+        const next = [...subs];
+        next[idx] = {
+          ...sub,
+          start: Number(start.toFixed(3)),
+          end: Number(end.toFixed(3)),
+        };
+        return { ...doc, subtitles: next };
+      };
+
+      updateLive(apply);
+      if (phase === "end") endInteraction();
+    },
+    [beginInteraction, endInteraction, updateLive]
+  );
+
+  // ------------------------------------------------------------------
+  // Text / style / language changes
+  // ------------------------------------------------------------------
+  const handleEditText = useCallback(
+    (subId, text) => {
+      beginInteraction();
+      updateLive((doc) => ({
+        ...doc,
+        subtitles: doc.subtitles.map((s) => {
+          if (s.id !== subId) return s;
+          if (doc.language === "english") {
+            return { ...s, english_text: text.trim() ? text : null };
+          }
+          if (doc.language === "romanized") {
+            return { ...s, romanized_text: text };
+          }
+          return s; // original is read-only
+        }),
+      }));
+    },
+    [beginInteraction, updateLive]
+  );
+
+  const handleStyleChange = useCallback(
+    (patch) => {
+      beginInteraction();
+      updateLive((doc) => ({
+        ...doc,
+        style: { ...doc.style, ...patch },
+      }));
+    },
+    [beginInteraction, updateLive]
+  );
+
+  const handleLanguageChange = useCallback(
+    (lang) => {
+      if (lang === "english" && !hasEnglish) return;
+      update((doc) => ({ ...doc, language: lang }));
+    },
+    [hasEnglish, update]
+  );
+
+  // ------------------------------------------------------------------
+  // Save / draft management
+  // ------------------------------------------------------------------
+  const handleSave = useCallback(async () => {
+    const problem = validateSubtitlesForSave(subtitles);
+    if (problem) {
+      setToast({ type: "error", text: problem });
       return;
     }
-
-    setIsSaving(true);
-    setError("");
-    setMessage("");
-
+    setSaveState("saving");
     try {
-      const response = await api.saveSubtitles(jobId, subtitles);
-      setMessage(response.message || `Saved ${response.subtitles_saved} subtitles`);
-      setOriginalSubtitles(JSON.parse(JSON.stringify(subtitles)));
+      await api.saveSubtitles(jobId, subtitles, { language, style });
+      setSaveState("saved");
+      setToast({ type: "info", text: "Subtitles saved." });
+      setTimeout(() => setSaveState("idle"), 2500);
     } catch (err) {
-      setError(err.message || "Failed to save subtitles");
-    } finally {
-      setIsSaving(false);
+      setToast({ type: "error", text: err.message || "Failed to save." });
     }
-  };
+  }, [jobId, subtitles, language, style]);
 
-  const handleExportSRT = async (mode) => {
-    if (!jobId) {
-      setError("No job ID provided");
+  const handleDownloadVideo = useCallback(async () => {
+    if (exportState !== "idle") return;
+    const problem = validateSubtitlesForSave(subtitles);
+    if (problem) {
+      setToast({ type: "error", text: problem });
       return;
     }
-
-    setIsExporting(true);
-    setError("");
-    setMessage("");
-
+    setExportState("exporting");
     try {
-      await api.exportSRT(jobId, mode);
-      setMessage(`Exported ${mode} SRT successfully`);
+      // Persist the current editor state so the render includes every edit.
+      await api.saveSubtitles(jobId, subtitles, { language, style });
+      await api.startVideoExport(jobId);
+      // FFmpeg burn-in runs on the backend — poll until it finishes.
+      const MAX_POLLS = 600; // ~15 minutes at 1.5s intervals
+      for (let i = 0; i < MAX_POLLS; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const state = await api.getVideoExportStatus(jobId);
+        if (state.status === "ready") break;
+        if (state.status === "failed") {
+          throw new Error(state.error || "Video export failed.");
+        }
+        if (state.status === "idle") {
+          throw new Error("Export was interrupted — please try again.");
+        }
+        if (i === MAX_POLLS - 1) {
+          throw new Error("Video export timed out — please try again.");
+        }
+      }
+      setExportState("downloading");
+      await api.downloadExportedVideo(jobId);
+      setToast({ type: "info", text: "Captioned video downloaded." });
     } catch (err) {
-      setError(err.message || `Failed to export ${mode} SRT`);
+      setToast({ type: "error", text: err.message || "Video export failed." });
     } finally {
-      setIsExporting(false);
+      setExportState("idle");
     }
-  };
+  }, [exportState, jobId, subtitles, language, style]);
 
-  const hasChanges =
-    JSON.stringify(subtitles) !== JSON.stringify(originalSubtitles);
+  const handleDiscardDraft = useCallback(async () => {
+    try {
+      localStorage.removeItem(DRAFT_PREFIX + jobId);
+    } catch {
+      /* ignore */
+    }
+    setHasLocalDraft(false);
+    setStatus("loading");
+    try {
+      const data = await api.getSubtitles(jobId);
+      reset({
+        subtitles: data.subtitles || [],
+        language: data.language || "romanized",
+        style: mergeCaptionStyle(data.style),
+      });
+      setSelectedId(null);
+      setStatus("ready");
+      setToast({ type: "info", text: "Local draft discarded." });
+    } catch (err) {
+      setLoadError(err.message || "Failed to reload subtitles.");
+      setStatus("error");
+    }
+  }, [jobId, reset]);
+
+  useEffect(() => {
+    if (!toast) return undefined;
+    const id = setTimeout(() => setToast(null), TOAST_TIMEOUT_MS);
+    return () => clearTimeout(id);
+  }, [toast]);
+
+  // ------------------------------------------------------------------
+  // Keyboard shortcuts
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const target = e.target;
+      const typing =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (typing) return;
+
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+        return;
+      }
+      if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        selectedId != null
+      ) {
+        e.preventDefault();
+        handleDelete();
+        return;
+      }
+      if (e.key === " " && target?.tagName !== "BUTTON") {
+        e.preventDefault();
+        playerRef.current?.togglePlay();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedId, handleDelete, undo, redo]);
+
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
+  if (status === "loading") {
+    return (
+      <div className="h-screen bg-gray-950 text-white flex flex-col items-center justify-center gap-3">
+        <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+        <p className="text-sm text-gray-400">Loading subtitle editor…</p>
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="h-screen bg-gray-950 text-white flex flex-col items-center justify-center gap-4 px-4">
+        <p className="text-red-400 text-sm max-w-md text-center">
+          {loadError}
+        </p>
+        <button
+          type="button"
+          onClick={() => navigate("/")}
+          className="px-6 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm"
+        >
+          ← Back to home
+        </button>
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
+    <div className="min-h-screen lg:h-screen flex flex-col bg-gray-950 text-white overflow-hidden">
       {/* Header */}
-      <header className="border-b border-gray-800 py-6">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex justify-between items-center">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight">TALAFUZ AI</h1>
-            <p className="text-gray-400 text-sm mt-1">Subtitle Editor</p>
-          </div>
+      <header className="h-14 shrink-0 flex items-center justify-between gap-3 px-4 border-b border-gray-800 bg-gray-900">
+        <div className="flex items-center gap-3 min-w-0">
           <button
+            type="button"
             onClick={() => navigate("/")}
-            className="px-4 py-2 text-sm bg-gray-700 hover:bg-gray-600 text-gray-100 rounded-lg transition"
+            className="text-gray-400 hover:text-white transition"
+            title="Back to home"
           >
-            ← Back
+            <IconArrowLeft size={18} />
+          </button>
+          <div className="min-w-0">
+            <h1 className="text-sm font-bold tracking-wide leading-tight">
+              TALAFUZ <span className="text-emerald-400">AI</span>
+            </h1>
+            <p className="text-[10px] text-gray-500 truncate">
+              Subtitle Editor · {jobId}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Language switch */}
+          <div className="flex rounded-lg overflow-hidden border border-gray-700">
+            {LANGUAGES.map((l) => {
+              const disabled = l.value === "english" && !hasEnglish;
+              return (
+                <button
+                  key={l.value}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => handleLanguageChange(l.value)}
+                  title={
+                    disabled
+                      ? "No English translations were generated for this job"
+                      : `Show ${l.label}`
+                  }
+                  className={`px-3 py-1.5 text-xs font-medium transition ${
+                    language === l.value
+                      ? "bg-emerald-500 text-gray-950"
+                      : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+                  } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+                >
+                  {l.label}
+                </button>
+              );
+            })}
+          </div>
+
+          <button
+            type="button"
+            onClick={undo}
+            disabled={!canUndo}
+            className="w-8 h-8 flex items-center justify-center rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Undo (Ctrl+Z)"
+          >
+            <IconUndo size={15} />
+          </button>
+          <button
+            type="button"
+            onClick={redo}
+            disabled={!canRedo}
+            className="w-8 h-8 flex items-center justify-center rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Redo (Ctrl+Shift+Z)"
+          >
+            <IconRedo size={15} />
+          </button>
+
+          <button
+            type="button"
+            onClick={handleDownloadVideo}
+            disabled={exportState !== "idle" || saveState === "saving"}
+            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg transition bg-gray-800 border border-gray-700 text-gray-200 hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            title="Save and render the current captions into the video, then download it"
+          >
+            {exportState === "idle" ? (
+              <IconDownload size={14} />
+            ) : (
+              <span className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+            )}
+            {exportState === "exporting"
+              ? "Rendering…"
+              : exportState === "downloading"
+              ? "Downloading…"
+              : "Download Video"}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleSave}
+            className={`flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg transition ${
+              saveState === "saved"
+                ? "bg-emerald-600 text-white"
+                : "bg-emerald-500 hover:bg-emerald-600 text-gray-950"
+            }`}
+          >
+            <IconSave size={14} />
+            {saveState === "saving"
+              ? "Saving…"
+              : saveState === "saved"
+              ? "Saved"
+              : "Save"}
           </button>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Messages */}
-        {message && (
-          <div className="mb-6 p-4 bg-green-900/30 border border-green-700 rounded-lg text-green-300 text-sm">
-            {message}
-          </div>
-        )}
-        {error && (
-          <div className="mb-6 p-4 bg-red-900/30 border border-red-700 rounded-lg text-red-300 text-sm">
-            {error}
-          </div>
-        )}
+      {/* Workspace */}
+      <main className="flex-1 min-h-0 flex flex-col lg:flex-row gap-3 p-3 overflow-y-auto lg:overflow-hidden">
+        <SubtitleList
+          className="w-full lg:w-[340px] shrink-0 h-[420px] lg:h-auto"
+          subtitles={subtitles}
+          language={language}
+          activeSubtitleId={activeSubtitle?.id ?? null}
+          selectedId={selectedId}
+          query={searchQuery}
+          onQueryChange={setSearchQuery}
+          matchIds={matchIds}
+          hasSelection={hasSelection}
+          canSplit={canSplit}
+          canMerge={canMerge}
+          onSelect={handleSelect}
+          onEditText={handleEditText}
+          onEditCommit={endInteraction}
+          onAdd={handleAdd}
+          onDelete={handleDelete}
+          onSplit={handleSplit}
+          onMerge={handleMerge}
+        />
 
-        {subtitles.length > 0 && (
-          <div className="grid grid-cols-3 gap-6">
-            {/* Left Column: Video Player & Mode Selector */}
-            <div className="col-span-2 space-y-6">
-              <VideoPlayer
-                ref={videoPlayerRef}
-                videoUrl={videoUrl}
-                subtitles={subtitles}
-                subtitleMode={subtitleMode}
-                onSubtitleClick={handleSubtitleClick}
-                onTimeUpdate={(time, subtitle) => {
-                  if (subtitle) {
-                    setActiveSubtitleId(subtitle.id);
-                  }
-                }}
-              />
+        <section className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
+          <VideoStage
+            ref={playerRef}
+            videoUrl={api.getVideoUrl(jobId)}
+            activeSubtitle={activeSubtitle}
+            language={language}
+            style={style}
+            currentTime={currentTime}
+            onCurrentTime={handleCurrentTime}
+            onDuration={handleDuration}
+            showSafeZone={showSafeZone}
+          />
 
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
-                <SubtitleModeSelector
-                  mode={subtitleMode}
-                  onModeChange={setSubtitleMode}
-                  hasEnglish={hasEnglish}
-                />
-              </div>
-            </div>
+          <Timeline
+            subtitles={subtitles}
+            duration={duration}
+            currentTime={currentTime}
+            selectedId={selectedId}
+            onSeek={handleSeek}
+            onSelect={(sub) => setSelectedId(sub.id)}
+            onTrim={handleTrim}
+          />
+        </section>
 
-            {/* Right Column: Controls */}
-            <div className="space-y-4">
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
-                <h3 className="font-semibold text-white">Actions</h3>
-
-                <button
-                  onClick={handleSaveChanges}
-                  disabled={!hasChanges || isSaving}
-                  className={`w-full px-4 py-2 rounded-lg font-medium transition text-sm ${
-                    hasChanges
-                      ? "bg-green-600 hover:bg-green-700 text-white"
-                      : "bg-gray-600 text-gray-400 cursor-not-allowed"
-                  }`}
-                >
-                  {isSaving ? "Saving..." : "Save Changes"}
-                </button>
-
-                <div className="pt-2 border-t border-gray-700 space-y-2">
-                  <p className="text-xs text-gray-400">Export as SRT:</p>
-                  <button
-                    onClick={() => handleExportSRT("romanized")}
-                    disabled={isExporting}
-                    className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition disabled:opacity-50"
-                  >
-                    Romanized
-                  </button>
-                  {hasEnglish && (
-                    <>
-                      <button
-                        onClick={() => handleExportSRT("english")}
-                        disabled={isExporting}
-                        className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition disabled:opacity-50"
-                      >
-                        English
-                      </button>
-                      <button
-                        onClick={() => handleExportSRT("dual")}
-                        disabled={isExporting}
-                        className="w-full px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition disabled:opacity-50"
-                      >
-                        Dual
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              <div className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded-lg p-3">
-                <p className="font-semibold text-white mb-2">Info</p>
-                <p>{subtitles.length} subtitles</p>
-                {hasChanges && <p className="text-yellow-400 mt-1">Unsaved changes</p>}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Bottom: Subtitle List */}
-        {subtitles.length > 0 && (
-          <div className="mt-8">
-            <SubtitleEditor
-              subtitles={subtitles}
-              activeSubtitleId={activeSubtitleId}
-              onEditSubtitle={handleEditSubtitle}
-              onSeekTo={handleSeekTo}
-            />
-          </div>
-        )}
-
-        {subtitles.length === 0 && !error && (
-          <div className="text-center py-12 text-gray-400">
-            <p>Loading subtitles...</p>
-          </div>
-        )}
+        <StylePanel
+          className="w-full lg:w-[320px] shrink-0 h-[520px] lg:h-auto"
+          style={style}
+          onStyleChange={handleStyleChange}
+          onStyleCommit={endInteraction}
+          selectedSubtitle={selectedSubtitle}
+          language={language}
+          onEditText={handleEditText}
+          onEditCommit={endInteraction}
+          showSafeZone={showSafeZone}
+          onToggleSafeZone={setShowSafeZone}
+        />
       </main>
+
+      {/* Local draft indicator */}
+      {hasLocalDraft && (
+        <button
+          type="button"
+          onClick={handleDiscardDraft}
+          className="fixed bottom-3 left-3 z-40 text-[11px] px-3 py-1.5 rounded-full bg-gray-800/95 border border-gray-700 text-gray-400 hover:text-white transition"
+          title="Discard the local draft and reload from the server"
+        >
+          Local draft active · discard
+        </button>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div
+          className={`fixed bottom-4 right-4 z-50 px-4 py-2.5 rounded-lg text-sm shadow-xl border max-w-sm ${
+            toast.type === "error"
+              ? "bg-red-950/95 border-red-700 text-red-200"
+              : "bg-gray-800/95 border-gray-600 text-gray-100"
+          }`}
+        >
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 }

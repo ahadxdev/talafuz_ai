@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 class VideoUploadResponse(BaseModel):
     job_id: str
@@ -68,6 +68,8 @@ class RomanizeResponse(BaseModel):
     model: str
     include_english: bool
     subtitles: List[RomanizedSubtitle]
+    language: Optional[str] = None                # Phase 4: editor display language
+    style: Optional[Dict[str, Any]] = None        # Phase 4: caption style config
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +89,8 @@ class EditedSubtitle(BaseModel):
 class SubtitleSaveRequest(BaseModel):
     """Request to save edited subtitles."""
     subtitles: List[EditedSubtitle]
+    language: Optional[str] = None                # selected display language
+    style: Optional[Dict[str, Any]] = None        # caption style configuration
 
 
 class SubtitleSaveResponse(BaseModel):
@@ -94,3 +98,22 @@ class SubtitleSaveResponse(BaseModel):
     job_id: str
     message: str
     subtitles_saved: int
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Video export (caption burn-in) models
+# ---------------------------------------------------------------------------
+
+class VideoExportStartResponse(BaseModel):
+    """Confirmation that a background render has been started."""
+    job_id: str
+    status: str
+    message: str
+
+
+class VideoExportStatusResponse(BaseModel):
+    """Render state for a job's captioned video."""
+    job_id: str
+    status: str          # idle | exporting | ready | failed
+    error: Optional[str] = None
+    filename: Optional[str] = None

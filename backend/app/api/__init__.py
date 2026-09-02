@@ -3,6 +3,7 @@ import json
 import logging
 from functools import partial
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -19,6 +20,13 @@ from ..services.romanization_service import (
     save_romanized_subtitles,
 )
 from ..services.srt_service import generate_srt
+from ..services.audio_service import is_ffmpeg_installed
+from ..services.video_export_service import (
+    VideoExportError,
+    get_export_state,
+    get_exported_video_path,
+    start_export,
+)
 from ..config import JOBS_DIR
 from ..models import (
     VideoUploadResponse,
@@ -31,6 +39,8 @@ from ..models import (
     EditedSubtitle,
     SubtitleSaveRequest,
     SubtitleSaveResponse,
+    VideoExportStartResponse,
+    VideoExportStatusResponse,
 )
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -274,14 +284,42 @@ async def romanize_transcript(job_id: str, body: RomanizeRequest = RomanizeReque
     return RomanizeResponse(**result)
 
 
+# User-edited subtitles (Phase 4 editor) are stored separately from the
+# generated romanized output and take precedence when loading.
+EDITED_SUBTITLES_FILENAME = "subtitles.json"
+
+
+def _load_edited_subtitles(job_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load user-edited subtitles.json; None when absent or invalid."""
+    path = Path(job_dir) / EDITED_SUBTITLES_FILENAME
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("subtitles"), list):
+        return None
+    return data
+
+
 @router.get("/{job_id}/subtitles", response_model=RomanizeResponse)
 async def get_subtitles(job_id: str):
-    """Return previously generated romanized subtitles for a job."""
+    """
+    Return subtitles for a job.
+
+    User-edited subtitles (subtitles.json, saved from the editor) take
+    precedence over the generated romanized_subtitles.json. The Phase 4
+    editor state (display language and caption style) is returned when
+    present.
+    """
     job_dir = JOBS_DIR / job_id
     if not job_dir.is_dir():
         raise HTTPException(status_code=404, detail="Unknown job ID.")
 
-    data = load_romanized_subtitles(job_dir)
+    data = _load_edited_subtitles(job_dir)
+    if data is None:
+        data = load_romanized_subtitles(job_dir)
     if data is None:
         raise HTTPException(
             status_code=404,
@@ -291,6 +329,8 @@ async def get_subtitles(job_id: str):
         job_id=data.get("job_id", job_id),
         model=data.get("model", ""),
         include_english=bool(data.get("include_english", False)),
+        language=data.get("language"),
+        style=data.get("style"),
         subtitles=[RomanizedSubtitle(**s) for s in data["subtitles"]],
     )
 
@@ -298,8 +338,6 @@ async def get_subtitles(job_id: str):
 # ---------------------------------------------------------------------------
 # Phase 4 — Subtitle editor endpoints
 # ---------------------------------------------------------------------------
-
-EDITED_SUBTITLES_FILENAME = "subtitles.json"
 
 
 @router.post("/{job_id}/subtitles/save", response_model=SubtitleSaveResponse)
@@ -324,6 +362,12 @@ async def save_edited_subtitles(job_id: str, request: SubtitleSaveRequest):
     # Validate subtitles before saving
     if not request.subtitles:
         raise HTTPException(status_code=400, detail="No subtitles provided.")
+
+    if request.language and request.language not in ("romanized", "english", "original"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid language. Must be 'romanized', 'english', or 'original'.",
+        )
 
     for sub in request.subtitles:
         if not isinstance(sub.start, (int, float)) or not isinstance(sub.end, (int, float)):
@@ -350,10 +394,13 @@ async def save_edited_subtitles(job_id: str, request: SubtitleSaveRequest):
     # Ensure directory exists
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save to subtitles.json
+    # Save to subtitles.json (language + caption style are part of the
+    # editor state and round-trip back through GET /subtitles)
     subtitles_path = job_dir / EDITED_SUBTITLES_FILENAME
     data = {
         "job_id": job_id,
+        "language": request.language,
+        "style": request.style,
         "subtitles": [
             {
                 "id": sub.id,
@@ -450,5 +497,101 @@ async def export_srt(
         media_type="text/plain; charset=utf-8",
         filename=f"subtitles_{mode}_{job_id}.srt",
         headers={"Content-Disposition": f'attachment; filename="subtitles_{mode}_{job_id}.srt"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Video export (caption burn-in) endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{job_id}/export/video", response_model=VideoExportStartResponse)
+async def export_video(job_id: str):
+    """
+    Start rendering the edited captions into the video (FFmpeg burn-in).
+
+    The render always uses the persisted editor state — subtitles.json when
+    present (saved from the Phase 4 editor), otherwise the generated
+    romanized_subtitles.json — so clients must save their edits before
+    exporting. The render itself runs on a background thread; follow
+    progress through GET /export/video/status.
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    video_path = VideoService.get_video_path(job_id)
+    if video_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No uploaded video found for this job ID.",
+        )
+
+    data = _load_edited_subtitles(job_dir) or load_romanized_subtitles(job_dir)
+    if data is None or not data.get("subtitles"):
+        raise HTTPException(
+            status_code=404,
+            detail="No subtitles available for this job. Generate subtitles first.",
+        )
+
+    if not is_ffmpeg_installed():
+        raise HTTPException(
+            status_code=503,
+            detail="FFmpeg is not installed on this system; video export is unavailable.",
+        )
+
+    try:
+        start_export(job_id, job_dir, video_path, data)
+    except VideoExportError as e:
+        raise HTTPException(status_code=_CONFLICT, detail=str(e))
+
+    return VideoExportStartResponse(
+        job_id=job_id,
+        status="exporting",
+        message="Video export started. Poll the status endpoint until it is ready.",
+    )
+
+
+@router.get("/{job_id}/export/video/status", response_model=VideoExportStatusResponse)
+async def get_video_export_status(job_id: str):
+    """Video export state for a job: idle | exporting | ready | failed."""
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    state = get_export_state(job_id)
+    return VideoExportStatusResponse(
+        job_id=job_id,
+        status=state.get("status", "idle"),
+        error=state.get("error"),
+        filename=state.get("filename"),
+    )
+
+
+@router.get("/{job_id}/export/video/file")
+async def download_exported_video(job_id: str):
+    """Download the captioned (burn-in) video for a job."""
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    state = get_export_state(job_id)
+    if state.get("status") == "exporting":
+        raise HTTPException(
+            status_code=_CONFLICT,
+            detail="Video export is still in progress.",
+        )
+
+    video_path = get_exported_video_path(job_id)
+    if video_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Exported video not found. Start an export first.",
+        )
+
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        filename=f"talafuz_captions_{job_id[:8]}.mp4",
     )
 

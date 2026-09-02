@@ -39,6 +39,14 @@ AUDIO_FILENAME = "audio.wav"
 AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 AUDIO_EXTRACTION_TIMEOUT = int(os.getenv("AUDIO_EXTRACTION_TIMEOUT", "600"))  # seconds
 
+# ---------------------------------------------------------------------------
+# Phase 5 — Video export (caption burn-in via FFmpeg + ASS subtitles)
+# ---------------------------------------------------------------------------
+# Output name of the rendered (captioned) video inside the job directory.
+EXPORTED_VIDEO_FILENAME = "captioned_video.mp4"
+# Hard cap for a single render (seconds) — re-encoding a long video is slow.
+VIDEO_EXPORT_TIMEOUT = int(os.getenv("VIDEO_EXPORT_TIMEOUT", "1800"))
+
 # ASR provider selection: "none" (not configured) | "alibaba"
 ASR_PROVIDER = os.getenv("ASR_PROVIDER", "none").strip().lower()
 

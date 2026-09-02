@@ -128,15 +128,21 @@ export const api = {
   },
 
   /**
-   * Phase 4 — save edited subtitles for a job
+   * Phase 4 — save edited subtitles for a job.
+   * `options` may carry the selected display language and the caption
+   * style configuration so the editor state round-trips through the backend.
    */
-  async saveSubtitles(jobId, subtitles) {
+  async saveSubtitles(jobId, subtitles, options = {}) {
+    const payload = { subtitles };
+    if (options.language) payload.language = options.language;
+    if (options.style) payload.style = options.style;
+
     const response = await fetch(
       `${API_BASE_URL}/api/videos/${jobId}/subtitles/save`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subtitles }),
+        body: JSON.stringify(payload),
       }
     );
 
@@ -170,6 +176,69 @@ export const api = {
     const link = document.createElement("a");
     link.href = url;
     link.download = `subtitles_${mode}_${jobId}.srt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  },
+
+  /**
+   * Phase 5 — start rendering the edited captions into the video
+   * (FFmpeg burn-in). Returns immediately; poll getVideoExportStatus()
+   * until the state is "ready".
+   */
+  async startVideoExport(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/export/video`,
+      { method: "POST" }
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to start video export");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Phase 5 — poll the video export state (idle | exporting | ready | failed)
+   */
+  async getVideoExportStatus(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/export/video/status`
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to fetch export status");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Phase 5 — download the captioned (burn-in) video once the export is ready
+   */
+  async downloadExportedVideo(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}/export/video/file`
+    );
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const error = new Error(data.detail || "Failed to download video");
+      error.status = response.status;
+      throw error;
+    }
+
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `talafuz_captions_${jobId.slice(0, 8)}.mp4`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);

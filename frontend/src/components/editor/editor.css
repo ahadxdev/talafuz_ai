@@ -1,0 +1,86 @@
+/* Phase 4 editor — caption animations and control styling. */
+
+@keyframes tf-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes tf-pop {
+  0% { transform: scale(0.55); opacity: 0; }
+  60% { transform: scale(1.08); opacity: 1; }
+  100% { transform: scale(1); }
+}
+
+@keyframes tf-slide-up {
+  from { transform: translateY(35%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes tf-slide-down {
+  from { transform: translateY(-35%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.tf-anim-fade { animation: tf-fade 0.28s ease-out both; }
+.tf-anim-pop { animation: tf-pop 0.32s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+.tf-anim-slide-up { animation: tf-slide-up 0.3s ease-out both; }
+.tf-anim-slide-down { animation: tf-slide-down 0.3s ease-out both; }
+
+/* Outline drawn behind the fill so the stroke never eats the glyph. */
+.tf-text-outline {
+  paint-order: stroke fill;
+  -webkit-text-stroke-linejoin: round;
+}
+
+/* Slim dark scrollbars for editor panels. */
+.tf-scroll { scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+.tf-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.tf-scroll::-webkit-scrollbar-track { background: transparent; }
+.tf-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+.tf-scroll::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+
+/* Panel sliders (range inputs). */
+input[type="range"].tf-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #374151;
+  outline: none;
+}
+input[type="range"].tf-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #22c55e;
+  cursor: pointer;
+  border: 2px solid #052e16;
+}
+input[type="range"].tf-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #22c55e;
+  cursor: pointer;
+  border: 2px solid #052e16;
+}
+
+/* Color swatch inputs. */
+input[type="color"].tf-color {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="color"].tf-color::-webkit-color-swatch-wrapper { padding: 2px; }
+input[type="color"].tf-color::-webkit-color-swatch {
+  border: 1px solid #4b5563;
+  border-radius: 0.375rem;
+}
