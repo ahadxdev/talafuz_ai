@@ -19,6 +19,9 @@ Implementation notes:
 - Long segments are split into readable subtitle chunks (≤2 lines of
   ~SUBTITLE_MAX_CHARS_PER_LINE characters) at word/punctuation boundaries;
   timestamps are proportionally distributed inside the original ASR timing.
+  The original-script text and the English translation are split in
+  alignment with those chunks, so each cue carries only its own original
+  and English line — never the whole segment's text.
 """
 import json
 import logging
@@ -253,6 +256,69 @@ def distribute_timestamps(
     return times
 
 
+def split_text_by_word_counts(text: str, word_counts: List[int]) -> Optional[List[str]]:
+    """
+    Split `text` into parts containing exactly the given whitespace word
+    counts.
+
+    Romanization preserves the original word order, so the original-script
+    text can be aligned with the romanized chunks word-for-word. Returns
+    None when the total word count does not match (e.g. the model merged or
+    split words), letting the caller fall back to proportional splitting.
+    """
+    words = text.split()
+    if sum(word_counts) != len(words):
+        return None
+    parts: List[str] = []
+    cursor = 0
+    for count in word_counts:
+        parts.append(" ".join(words[cursor: cursor + count]))
+        cursor += count
+    return parts
+
+
+def split_text_proportionally(text: str, weights: List[int]) -> List[str]:
+    """
+    Split `text` into len(weights) parts at word boundaries, each part
+    receiving roughly the same share of characters as its weight.
+
+    Used for texts that keep the content order but not the word count
+    (e.g. English translations) to align them with the romanized chunks by
+    proportional size. Every part receives at least one word whenever the
+    text has enough words for all parts.
+    """
+    n = len(weights)
+    words = text.split()
+    if n <= 0:
+        return []
+    if not words:
+        return [""] * n
+    if n == 1:
+        return [text]
+
+    total_chars = sum(len(w) + 1 for w in words)
+    total_weight = sum(weights) or 1
+
+    parts: List[str] = []
+    remaining = words
+    for i, weight in enumerate(weights):
+        if i == n - 1:
+            parts.append(" ".join(remaining))
+            break
+        # Take words until this part's share of the character budget is
+        # filled, always leaving at least one word per remaining part.
+        budget = total_chars * (weight / total_weight)
+        taken = 0
+        chars = 0
+        limit = len(remaining) - (n - 1 - i)
+        while taken < limit and chars < budget:
+            chars += len(remaining[taken]) + 1
+            taken += 1
+        parts.append(" ".join(remaining[:taken]))
+        remaining = remaining[taken:]
+    return parts
+
+
 # ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
@@ -299,7 +365,10 @@ class QwenRomanizationService:
         Romanize ASR transcript segments and produce segmented subtitles.
 
         `segments` are transcript.json entries: {id, start, end, text}.
-        Returns Subtitle cues; original ASR text is preserved untouched.
+        Returns Subtitle cues; the stored transcript itself is never
+        modified. When a long segment is split into several cues, each
+        cue's original and English lines are aligned to its romanized
+        chunk instead of repeating the whole segment.
         """
         self._validate_segments(segments)
 
@@ -380,14 +449,32 @@ class QwenRomanizationService:
                 chunks, float(seg["start"]), float(seg["end"]),
                 config.SUBTITLE_MIN_DURATION,
             )
-            for chunk, (cue_start, cue_end) in zip(chunks, times):
+            # Align the original-script and English texts with the romanized
+            # chunks so each cue carries only its own lines — a long segment
+            # (e.g. a whole-video ASR segment) must not repeat its full text
+            # under every cue.
+            weights = [max(len(chunk), 1) for chunk in chunks]
+            original_parts = split_text_by_word_counts(
+                seg["text"], [len(chunk.split()) for chunk in chunks]
+            )
+            if original_parts is None:
+                original_parts = split_text_proportionally(seg["text"], weights)
+            english_text = english.get(i)
+            english_parts = (
+                split_text_proportionally(english_text, weights)
+                if english_text
+                else [None] * len(chunks)
+            )
+            for chunk, (cue_start, cue_end), original_part, english_part in zip(
+                chunks, times, original_parts, english_parts
+            ):
                 subtitles.append(Subtitle(
                     id=len(subtitles) + 1,
                     start=cue_start,
                     end=cue_end,
-                    original_text=seg["text"],
+                    original_text=original_part,
                     romanized_text=chunk,
-                    english_text=english.get(i),
+                    english_text=english_part,
                 ))
         if not subtitles:
             raise RomanizationResponseError("No subtitles were produced.")
