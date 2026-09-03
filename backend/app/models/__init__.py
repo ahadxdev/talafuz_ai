@@ -49,9 +49,10 @@ class TranscriptResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class RomanizeRequest(BaseModel):
-    # English translation is optional and generated separately from
-    # romanization. Romanized subtitles are always produced.
-    include_english: bool = False
+    # The English translation is generated alongside romanization by
+    # default — the editor, SRT and video exports all use it. Romanized
+    # subtitles are always produced.
+    include_english: bool = True
 
 
 class RomanizedSubtitle(BaseModel):
@@ -117,3 +118,23 @@ class VideoExportStatusResponse(BaseModel):
     status: str          # idle | exporting | ready | failed
     error: Optional[str] = None
     filename: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Drafts — saved job listing for the Home page
+# ---------------------------------------------------------------------------
+
+class DraftItem(BaseModel):
+    """A single saved job shown in the drafts list."""
+    job_id: str
+    video_filename: Optional[str] = None
+    created_at: str               # ISO-8601 timestamp
+    status: str                   # uploaded | completed | failed | …
+    subtitles_saved: bool = False # True when user-edited subtitles.json exists
+    has_export: bool = False      # True when captioned_video.mp4 exists
+
+
+class DraftsListResponse(BaseModel):
+    """Response for GET /drafts."""
+    drafts: List[DraftItem]
+    total: int

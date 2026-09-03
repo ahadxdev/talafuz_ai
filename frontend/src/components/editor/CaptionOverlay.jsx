@@ -6,7 +6,8 @@ import { getActiveWordIndex, getSubtitleText } from "../../utils/subtitleUtils";
  * Draws the active subtitle with the editor style (font, colors, outline,
  * shadow, background, animation) and optional per-word highlighting.
  * Real word-level timestamps (`subtitle.words`) are used when available;
- * otherwise the active word is estimated proportionally across the cue.
+ * otherwise the active word is estimated from each word's length and
+ * punctuation pauses (speech-weighted), matching the video export.
  */
 
 function hexToRgba(hex, alpha) {
@@ -25,11 +26,12 @@ export function CaptionOverlay({
   style,
   currentTime,
   showSafeZone = false,
+  highlightEnabled = true,
 }) {
   const text = getSubtitleText(subtitle, language) || "";
   const words = text.split(/\s+/).filter(Boolean);
   const activeWordIndex =
-    style.wordHighlight && words.length > 0 && subtitle
+    style.wordHighlight && highlightEnabled && words.length > 0 && subtitle
       ? getActiveWordIndex(words, subtitle, currentTime)
       : -1;
 
@@ -55,11 +57,11 @@ export function CaptionOverlay({
       {words.length > 0 && subtitle && (
         <div
           key={subtitle.id}
-          className={`absolute ${animClass}`}
+          className={`!w-full absolute ${animClass}`}
           style={{
             left: `${style.posX}%`,
             top: `${style.posY}%`,
-            maxWidth: `${style.boxWidth ?? 88}%`,
+            maxWidth: `${style.boxWidth ?? 95}%`,            
             transform: "translate(-50%, -50%)",
             textAlign: style.alignment,
             ...(hasBackground

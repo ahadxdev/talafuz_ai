@@ -52,6 +52,7 @@ export const VideoStage = forwardRef(function VideoStage(
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [highlightEnabled, setHighlightEnabled] = useState(true);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
   const [naturalSize, setNaturalSize] = useState({ w: 0, h: 0 });
 
@@ -230,6 +231,7 @@ export const VideoStage = forwardRef(function VideoStage(
             style={style}
             currentTime={currentTime}
             showSafeZone={showSafeZone}
+            highlightEnabled={highlightEnabled}
           />
         </div>
 
@@ -287,6 +289,22 @@ export const VideoStage = forwardRef(function VideoStage(
           onChange={handleVolumeChange}
           aria-label="Volume"
         />
+
+        <button
+          type="button"
+          onClick={() => setHighlightEnabled((v) => !v)}
+          className={`transition ${
+            highlightEnabled ? "text-emerald-400" : "text-gray-600 hover:text-gray-400"
+          }`}
+          title={highlightEnabled ? "Hide word highlight" : "Show word highlight"}
+        >
+          <span className="relative inline-block">
+            <span className="text-xs font-black tracking-tighter">Aa</span>
+            {highlightEnabled && (
+              <span className="absolute -bottom-0.5 left-1/2 -translate-x-1/2 w-4 h-0.5 rounded-full bg-emerald-400" />
+            )}
+          </span>
+        </button>
 
         <button
           type="button"

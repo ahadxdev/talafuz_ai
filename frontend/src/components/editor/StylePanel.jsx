@@ -383,7 +383,7 @@ export function StylePanel({
             <Section title="Caption box">
               <SliderRow
                 label="Box width"
-                value={Math.round(style.boxWidth ?? 88)}
+                value={Math.round(style.boxWidth ?? 95)}
                 min={30}
                 max={100}
                 step={1}
@@ -453,8 +453,9 @@ export function StylePanel({
                 />
               )}
               <p className="text-[10px] text-gray-600 leading-relaxed">
-                The active word is estimated from the cue timing — real
-                word-level timestamps will refine this later.
+                Words are highlighted in proportion to their estimated
+                speaking time — longer words and punctuation pauses hold
+                the highlight longer, matching the exported video.
               </p>
             </Section>
           </>

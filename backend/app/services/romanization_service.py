@@ -16,12 +16,14 @@ Implementation notes:
 - Transcript segments are sent in batches; the model must return a JSON
   array aligned by index. Responses are strictly validated — results are
   never fabricated.
-- Long segments are split into readable subtitle chunks (≤2 lines of
-  ~SUBTITLE_MAX_CHARS_PER_LINE characters) at word/punctuation boundaries;
-  timestamps are proportionally distributed inside the original ASR timing.
-  The original-script text and the English translation are split in
-  alignment with those chunks, so each cue carries only its own original
-  and English line — never the whole segment's text.
+- Long segments are split into short, creator-style cues (~3–5 words,
+  capped by SUBTITLE_MAX_CHARS_PER_LINE * SUBTITLE_MAX_LINES characters) at
+  word/punctuation boundaries; timestamps are distributed across the cues
+  in proportion to each cue's estimated speaking time (word length +
+  punctuation pauses). The original-script text and the English
+  translation are split in alignment with those chunks, so each cue
+  carries only its own original and English line — never the whole
+  segment's text.
 """
 import json
 import logging
@@ -174,28 +176,59 @@ Texts:
 _SENTENCE_END_RE = re.compile(r"[.?!،।؟…]\s*$")
 
 
-def split_text_into_chunks(text: str, max_chars: int) -> List[str]:
+def speech_weight(text: str) -> float:
     """
-    Split text into readable subtitle chunks at word boundaries.
+    Estimated speaking-time weight for a text: every word contributes its
+    character length plus a small constant, and trailing sentence/clause
+    punctuation adds a natural pause. Mirrors speechWeight() in the
+    frontend subtitleUtils so cue boundaries, preview word highlighting
+    and burn-in timing all agree.
+    """
+    weight = 0.0
+    for word in text.split():
+        w = max(len(word), 1) + 2
+        if word[-1] in ".!?…":
+            w += 5
+        elif word[-1] in ",;:—–":
+            w += 3
+        weight += w
+    return weight or 1.0
 
-    Prefers breaking after sentence-ending punctuation once a chunk is
-    reasonably filled; never breaks inside a word, number, name or term.
+
+def split_text_into_chunks(
+    text: str, max_chars: int, max_words: Optional[int] = None
+) -> List[str]:
+    """
+    Split text into short, creator-style subtitle chunks at word
+    boundaries.
+
+    `max_words` (when given) caps the words per chunk so cues stay around
+    3–5 words; `max_chars` stays the hard ceiling. Prefers breaking right
+    after sentence-ending punctuation; never breaks inside a word, number,
+    name or term.
     """
     text = " ".join(text.split())
     if not text:
         return []
-    if len(text) <= max_chars:
+    if len(text) <= max_chars and (
+        max_words is None or len(text.split(" ")) <= max_words
+    ):
         return [text]
 
     chunks: List[str] = []
     current = ""
     for word in text.split(" "):
         candidate = f"{current} {word}".strip()
-        if len(candidate) <= max_chars:
+        fits_chars = len(candidate) <= max_chars
+        fits_words = max_words is None or candidate.count(" ") < max_words
+        if fits_chars and fits_words:
             current = candidate
             # Prefer a natural break right after sentence punctuation once
-            # the chunk is reasonably filled.
-            if len(current) >= max_chars * 0.6 and _SENTENCE_END_RE.search(current):
+            # the chunk holds a couple of words.
+            if (
+                len(current.split(" ")) >= 2
+                and _SENTENCE_END_RE.search(current)
+            ):
                 chunks.append(current)
                 current = ""
         else:
@@ -212,7 +245,10 @@ def split_text_into_chunks(text: str, max_chars: int) -> List[str]:
     # Avoid a tiny trailing chunk when it fits the previous one.
     if len(chunks) > 1 and len(chunks[-1]) <= max_chars * 0.25:
         merged = f"{chunks[-2]} {chunks[-1]}"
-        if len(merged) <= max_chars:
+        merged_fits = len(merged) <= max_chars and (
+            max_words is None or merged.count(" ") < max_words
+        )
+        if merged_fits:
             chunks[-2] = merged
             chunks.pop()
     return chunks
@@ -233,7 +269,7 @@ def distribute_timestamps(
         return [(start, end)] * n
 
     duration = end - start
-    weights = [max(len(c), 1) for c in chunks]
+    weights = [speech_weight(c) for c in chunks]
     total = sum(weights)
     shares = [w / total for w in weights]
 
@@ -437,6 +473,7 @@ class QwenRomanizationService:
         english: Dict[int, str],
     ) -> List[Subtitle]:
         max_chars = config.SUBTITLE_MAX_CHARS_PER_LINE * config.SUBTITLE_MAX_LINES
+        max_words = config.SUBTITLE_MAX_WORDS_PER_CUE
         subtitles: List[Subtitle] = []
         for i, seg in enumerate(segments):
             rom_text = (romanized[i] or "").strip()
@@ -444,7 +481,7 @@ class QwenRomanizationService:
                 raise RomanizationResponseError(
                     f"The model returned empty romanized text for segment {i}."
                 )
-            chunks = split_text_into_chunks(rom_text, max_chars)
+            chunks = split_text_into_chunks(rom_text, max_chars, max_words=max_words)
             times = distribute_timestamps(
                 chunks, float(seg["start"]), float(seg["end"]),
                 config.SUBTITLE_MIN_DURATION,
@@ -453,7 +490,7 @@ class QwenRomanizationService:
             # chunks so each cue carries only its own lines — a long segment
             # (e.g. a whole-video ASR segment) must not repeat its full text
             # under every cue.
-            weights = [max(len(chunk), 1) for chunk in chunks]
+            weights = [speech_weight(chunk) for chunk in chunks]
             original_parts = split_text_by_word_counts(
                 seg["text"], [len(chunk.split()) for chunk in chunks]
             )

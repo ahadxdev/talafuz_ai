@@ -1,12 +1,15 @@
 import asyncio
 import json
 import logging
+import os
+import shutil
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from ..services import VideoService
 from ..services.pipeline import run_processing_job
 from ..services.job_manager import job_manager, resolve_job_state
@@ -27,7 +30,7 @@ from ..services.video_export_service import (
     get_exported_video_path,
     start_export,
 )
-from ..config import JOBS_DIR
+from ..config import JOBS_DIR, EXPORTED_VIDEO_FILENAME
 from ..models import (
     VideoUploadResponse,
     ProcessResponse,
@@ -41,6 +44,8 @@ from ..models import (
     SubtitleSaveResponse,
     VideoExportStartResponse,
     VideoExportStatusResponse,
+    DraftItem,
+    DraftsListResponse,
 )
 
 router = APIRouter(prefix="/videos", tags=["videos"])
@@ -77,6 +82,85 @@ async def upload_video(file: UploadFile = File(...)):
         size=file_size,
         status="uploaded"
     )
+
+
+# ---------------------------------------------------------------------------
+# Drafts — list saved jobs and delete them
+# ---------------------------------------------------------------------------
+
+
+@router.get("/drafts", response_model=DraftsListResponse)
+async def list_drafts():
+    """
+    List all saved jobs (drafts) with metadata.
+
+    Each job directory under JOBS_DIR is inspected for its video filename,
+    creation timestamp, processing status, and whether user-edited subtitles
+    or an exported video exist.
+    """
+    drafts = []
+    if not JOBS_DIR.is_dir():
+        return DraftsListResponse(drafts=[], total=0)
+
+    for entry in sorted(JOBS_DIR.iterdir(), key=lambda p: p.stat().st_ctime, reverse=True):
+        if not entry.is_dir():
+            continue
+        job_id = entry.name
+
+        # Resolve video filename (skip exported captioned_video.mp4)
+        video_filename = None
+        video_path = VideoService.get_video_path(job_id)
+        if video_path is not None:
+            video_filename = video_path.name
+
+        # Creation time from directory
+        created_iso = datetime.fromtimestamp(entry.stat().st_ctime, tz=timezone.utc).isoformat()
+
+        # Processing status (reconstruct from artifacts if not in memory)
+        state = resolve_job_state(job_id)
+        status = state["status"] if state else "unknown"
+
+        # Subtitles saved?
+        subtitles_saved = (entry / EDITED_SUBTITLES_FILENAME).exists()
+
+        # Export exists?
+        has_export = (entry / EXPORTED_VIDEO_FILENAME).exists()
+
+        drafts.append(DraftItem(
+            job_id=job_id,
+            video_filename=video_filename,
+            created_at=created_iso,
+            status=status,
+            subtitles_saved=subtitles_saved,
+            has_export=has_export,
+        ))
+
+    return DraftsListResponse(drafts=drafts, total=len(drafts))
+
+
+@router.delete("/{job_id}")
+async def delete_job(job_id: str):
+    """
+    Delete a job and all its data permanently.
+    """
+    job_dir = JOBS_DIR / job_id
+    if not job_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown job ID.")
+
+    try:
+        shutil.rmtree(job_dir)
+    except OSError as e:
+        logger.error("Failed to delete job directory for %s: %s", job_id, e)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete job data. Please try again.",
+        )
+
+    # Also clean up in-memory state if present
+    # (JobManager has no delete method, but the state is ephemeral anyway)
+
+    logger.info("Deleted job %s and its data directory", job_id)
+    return {"message": "Job deleted successfully.", "job_id": job_id}
 
 
 @router.get("/{job_id}/file")
@@ -429,7 +513,7 @@ async def save_edited_subtitles(job_id: str, request: SubtitleSaveRequest):
 @router.get("/{job_id}/export/srt")
 async def export_srt(
     job_id: str,
-    mode: str = Query("romanized", regex="^(romanized|english|dual)$"),
+    mode: str = Query("romanized", pattern="^(romanized|english|dual|original)$"),
 ):
     """
     Export subtitles as SRT file.
@@ -440,6 +524,7 @@ async def export_srt(
             - "romanized": romanized text only
             - "english": English text only
             - "dual": romanized text followed by English text
+            - "original": original ASR transcription text
 
     Returns:
         SRT file as downloadable response.
@@ -491,11 +576,11 @@ async def export_srt(
         logger.warning("SRT generation failed for job %s (mode=%s): %s", job_id, mode, e)
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Return as downloadable file
-    return FileResponse(
+    # Return as downloadable file (generated text — not a file on disk,
+    # so a plain Response is used instead of FileResponse)
+    return Response(
         content=srt_content.encode("utf-8"),
         media_type="text/plain; charset=utf-8",
-        filename=f"subtitles_{mode}_{job_id}.srt",
         headers={"Content-Disposition": f'attachment; filename="subtitles_{mode}_{job_id}.srt"'},
     )
 

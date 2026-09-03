@@ -28,7 +28,7 @@ export const DEFAULT_CAPTION_STYLE = {
   lineHeight: 1.2,
   wordHighlight: true,
   highlightColor: "#22C55E",
-  boxWidth: 88, // % of video width the caption box may span
+  boxWidth: 95, // % of video width the caption box may span
 };
 
 export const FONT_FAMILIES = [

@@ -2,14 +2,23 @@ import { useEffect, useRef, useState } from "react";
 import { getSubtitleText } from "../../utils/subtitleUtils";
 import { secondsToTimestamp } from "../../utils/timeUtils";
 import {
+  IconChevronDown,
   IconMerge,
   IconPencil,
   IconPlus,
   IconScissors,
   IconSearch,
   IconTrash,
+  IconWand,
   IconX,
 } from "./icons";
+
+/** Caption length modes offered by the Length menu. */
+const LENGTH_MODES = [
+  { value: "word", label: "Word by word", hint: "One word per caption (pop style)" },
+  { value: "short", label: "Short · 3–5 words", hint: "Creator-style caption groups" },
+  { value: "sentence", label: "Sentence", hint: "Full sentence-length cues" },
+];
 
 /**
  * Phase 4 — Left panel: caption list with search and inline text editing.
@@ -37,10 +46,12 @@ export function SubtitleList({
   onDelete,
   onSplit,
   onMerge,
+  onResegment,
 }) {
   const [editingId, setEditingId] = useState(null);
   const [draft, setDraft] = useState("");
   const [originalDraft, setOriginalDraft] = useState("");
+  const [lengthMenuOpen, setLengthMenuOpen] = useState(false);
   const activeItemRef = useRef(null);
 
   // Keep the active (playing) caption in view.
@@ -128,7 +139,7 @@ export function SubtitleList({
         )}
 
         {/* Toolbar */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
             onClick={onAdd}
@@ -155,6 +166,46 @@ export function SubtitleList({
           >
             <IconMerge size={13} /> Merge
           </button>
+          {/* Caption length — re-segment into word / short / sentence cues */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setLengthMenuOpen((v) => !v)}
+              disabled={subtitles.length === 0}
+              className={`${toolbarButton} bg-gray-800 text-gray-300 hover:bg-gray-700`}
+              title="Re-segment captions into word, short or sentence cues — undo with Ctrl+Z"
+            >
+              <IconWand size={13} /> Length <IconChevronDown size={12} />
+            </button>
+            {lengthMenuOpen && (
+              <>
+                <button
+                  type="button"
+                  aria-label="Close menu"
+                  className="fixed inset-0 z-40 cursor-default"
+                  onClick={() => setLengthMenuOpen(false)}
+                />
+                <div className="absolute left-0 top-full mt-1.5 z-50 w-60 bg-gray-900 border border-gray-700 rounded-lg shadow-xl py-1">
+                  {LENGTH_MODES.map((m) => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      onClick={() => {
+                        setLengthMenuOpen(false);
+                        onResegment(m.value);
+                      }}
+                      className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 transition"
+                    >
+                      {m.label}
+                      <span className="block text-[10px] text-gray-500">
+                        {m.hint}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
           <button
             type="button"
             onClick={onDelete}

@@ -1,425 +1,565 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { VideoUploader } from "../components/VideoUploader";
-import { VideoPreview } from "../components/VideoPreview";
-import { ProcessingStatus } from "../components/ProcessingStatus";
-import { TranscriptPanel } from "../components/TranscriptPanel";
-import { SubtitlePanel } from "../components/SubtitlePanel";
+import { VideoDropzone } from "../components/VideoDropzone";
+import { PipelineTimeline } from "../components/PipelineTimeline";
 import { api } from "../services/api";
+
+/**
+ * Phase 5 — Home: upload → automatic pipeline → editor.
+ *
+ * Picking a video kicks off the whole flow without further clicks — upload,
+ * audio extraction, ASR transcription and romanization run back to back,
+ * each stage mirrored in the PipelineTimeline, and the browser is routed
+ * straight into the subtitle editor when the captions are ready. Matching
+ * the editor chrome keeps the app feeling like one tool.
+ */
 
 const STATUS_POLL_INTERVAL_MS = 1500;
 const STATUS_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CONSECUTIVE_POLL_ERRORS = 3;
+const REDIRECT_DELAY_MS = 900;
 
 export function Home() {
   const navigate = useNavigate();
-  const [uploadedVideo, setUploadedVideo] = useState(null);
-  const [isError, setIsError] = useState(false);
+
+  // Active tab: upload | drafts
+  const [tab, setTab] = useState("upload");
+
+  // Pipeline state machine. `phase` drives the timeline; `errorStep` names
+  // the stage a retry should restart from.
+  const [phase, setPhase] = useState("idle"); // idle | uploading | processing | romanizing | redirecting | error
+  const [errorStep, setErrorStep] = useState(null); // upload | process | romanize
   const [errorMessage, setErrorMessage] = useState("");
-  const [isUploading, setIsUploading] = useState(false);
+  const [errorCode, setErrorCode] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [fileSizeMB, setFileSizeMB] = useState(0);
+  const [jobId, setJobId] = useState(null);
+  const [backendStage, setBackendStage] = useState(null); // queued | extracting_audio | transcribing
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [file, setFile] = useState(null); // kept for upload retries
 
-  // Phase 2 — processing state
-  const [processing, setProcessing] = useState("idle"); // idle | starting | running | completed | failed
-  const [processingStage, setProcessingStage] = useState(null);
-  const [processingErrorCode, setProcessingErrorCode] = useState(null);
-  const [processingError, setProcessingError] = useState("");
-  const [transcript, setTranscript] = useState(null);
-  const pollStopRef = useRef(() => {});
+  // Drafts state
+  const [drafts, setDrafts] = useState([]);
+  const [draftsLoading, setDraftsLoading] = useState(false);
+  const [draftsError, setDraftsError] = useState("");
+  const [deletingId, setDeletingId] = useState(null);
 
-  // Phase 3 — romanized subtitles state
-  const [subtitles, setSubtitles] = useState(null);
-  const [subtitlesModel, setSubtitlesModel] = useState(null);
-  const [romanization, setRomanization] = useState("idle"); // idle | running | done | failed
-  const [romanError, setRomanError] = useState("");
-  const [includeEnglish, setIncludeEnglish] = useState(false);
-  const [showEnglish, setShowEnglish] = useState(false);
+  const cancelledRef = useRef(false);
 
-  const stopPolling = useCallback(() => {
-    pollStopRef.current();
+  // ------------------------------------------------------------------
+  // Drafts fetching
+  // ------------------------------------------------------------------
+  const fetchDrafts = useCallback(async () => {
+    setDraftsLoading(true);
+    setDraftsError("");
+    try {
+      const data = await api.getDrafts();
+      setDrafts(data.drafts || []);
+    } catch (err) {
+      setDraftsError(err.message || "Could not load drafts.");
+    } finally {
+      setDraftsLoading(false);
+    }
   }, []);
 
-  const handleVideoSelect = (file) => {
-    setIsError(false);
-    setErrorMessage("");
-  };
-
-  const handleUploadStart = () => {
-    setIsUploading(true);
-    setIsError(false);
-  };
-
-  const handleUploadComplete = (response) => {
-    stopPolling();
-    setUploadedVideo(response);
-    setIsUploading(false);
-    setProcessing("idle");
-    setProcessingStage(null);
-    setProcessingErrorCode(null);
-    setProcessingError("");
-    setTranscript(null);
-    resetPhase3();
-  };
-
-  const resetPhase3 = () => {
-    setSubtitles(null);
-    setSubtitlesModel(null);
-    setRomanization("idle");
-    setRomanError("");
-    setShowEnglish(false);
-  };
-
-  const handleError = (message) => {
-    setIsError(true);
-    setErrorMessage(message);
-    setIsUploading(false);
-  };
-
-  const handleReset = () => {
-    stopPolling();
-    setUploadedVideo(null);
-    setIsError(false);
-    setErrorMessage("");
-    setIsUploading(false);
-    setProcessing("idle");
-    setProcessingStage(null);
-    setProcessingErrorCode(null);
-    setProcessingError("");
-    setTranscript(null);
-    resetPhase3();
-  };
-
-  // Poll GET /status until the job completes, fails, or times out.
+  // Fetch drafts when switching to the drafts tab
   useEffect(() => {
-    if (processing !== "running" || !uploadedVideo?.job_id) return undefined;
+    if (tab === "drafts") {
+      fetchDrafts();
+    }
+  }, [tab, fetchDrafts]);
 
-    let cancelled = false;
-    let interval = null;
-    let errorCount = 0;
-    const startedAt = Date.now();
-
-    const poll = async () => {
+  const handleDeleteDraft = useCallback(
+    async (draftJobId) => {
+      if (!window.confirm("Delete this draft permanently? This cannot be undone.")) return;
+      setDeletingId(draftJobId);
       try {
-        const status = await api.getJobStatus(uploadedVideo.job_id);
-        if (cancelled) return;
-        errorCount = 0;
-
-        if (status.status === "completed") {
-          try {
-            const data = await api.getTranscript(uploadedVideo.job_id);
-            if (cancelled) return;
-            setTranscript(data.segments ?? []);
-            setProcessingStage("completed");
-            setProcessing("completed");
-            // Restore previously generated subtitles, if any. The status
-            // endpoint reports subtitles_available, so no 404 probe is made.
-            if (status.subtitles_available) {
-              try {
-                const subs = await api.getSubtitles(uploadedVideo.job_id);
-                if (cancelled) return;
-                setSubtitles(subs.subtitles ?? []);
-                setSubtitlesModel(subs.model ?? null);
-                setShowEnglish(!!subs.include_english);
-                setRomanization("done");
-              } catch {
-                // Subtitles vanished between checks — safe to ignore.
-              }
-            }
-          } catch (err) {
-            if (cancelled) return;
-            setProcessingErrorCode("TRANSCRIPT_FETCH");
-            setProcessingError(err.message || "Failed to load transcript.");
-            setProcessing("failed");
-          }
-        } else if (status.status === "failed") {
-          setProcessingErrorCode(status.error_code ?? null);
-          setProcessingError(
-            status.error || "Processing failed. Please try again."
-          );
-          setProcessing("failed");
-        } else {
-          setProcessingStage(status.status);
-          if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
-            setProcessingErrorCode("TIMEOUT");
-            setProcessingError("Processing is taking too long. Please try again.");
-            setProcessing("failed");
-          }
-        }
+        await api.deleteDraft(draftJobId);
+        setDrafts((prev) => prev.filter((d) => d.job_id !== draftJobId));
       } catch (err) {
-        if (cancelled) return;
-        errorCount += 1;
-        if (errorCount >= MAX_CONSECUTIVE_POLL_ERRORS) {
-          setProcessingErrorCode("NETWORK");
-          setProcessingError(
-            err.message || "Could not reach the server. Check that the backend is running."
-          );
-          setProcessing("failed");
+        alert("Failed to delete: " + (err.message || "Unknown error"));
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    []
+  );
+
+  const handleEditDraft = useCallback(
+    (draftJobId) => {
+      navigate(`/editor/${draftJobId}`);
+    },
+    [navigate]
+  );
+
+  // ------------------------------------------------------------------
+  // Elapsed timer
+  // ------------------------------------------------------------------
+  useEffect(() => {
+    if (phase === "idle" || phase === "error" || phase === "redirecting") {
+      return undefined;
+    }
+    const id = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  useEffect(() => {
+    cancelledRef.current = false;
+    return () => {
+      cancelledRef.current = true;
+    };
+  }, []);
+
+  const fail = useCallback((step, message, code = null) => {
+    setErrorStep(step);
+    setErrorCode(code);
+    setErrorMessage(message || "Something went wrong. Please try again.");
+    setPhase("error");
+  }, []);
+
+  const reset = useCallback(() => {
+    cancelledRef.current = true;
+    setPhase("idle");
+    setErrorStep(null);
+    setErrorMessage("");
+    setErrorCode(null);
+    setFileName("");
+    setFileSizeMB(0);
+    setJobId(null);
+    setBackendStage(null);
+    setElapsedSeconds(0);
+    setFile(null);
+  }, []);
+
+  // ------------------------------------------------------------------
+  // Stage 1 — upload
+  // ------------------------------------------------------------------
+  const runUpload = useCallback(
+    async (videoFile) => {
+      setPhase("uploading");
+      setErrorMessage("");
+      setErrorStep(null);
+      setErrorCode(null);
+      setElapsedSeconds(0);
+      try {
+        const response = await api.uploadVideo(videoFile);
+        if (cancelledRef.current) return;
+        setJobId(response.job_id);
+        runProcessingRef.current(response.job_id);
+      } catch (err) {
+        if (cancelledRef.current) return;
+        fail("upload", err.message || "Upload failed.");
+      }
+    },
+    [fail]
+  );
+
+  const handleFile = useCallback(
+    (picked) => {
+      setFile(picked);
+      setFileName(picked.name);
+      setFileSizeMB((picked.size / (1024 * 1024)).toFixed(1));
+      runUpload(picked);
+    },
+    [runUpload]
+  );
+
+  // ------------------------------------------------------------------
+  // Stage 2 — processing (audio extraction + ASR), polled
+  //
+  // Declared before its dependents and reached through refs so the three
+  // stage runners can call each other without ordering or staleness
+  // issues (useCallback deps cannot reference a const declared later).
+  // ------------------------------------------------------------------
+  const runRomanizationRef = useRef(() => {});
+  const runProcessingRef = useRef(() => {});
+
+  const runProcessing = useCallback(
+    async (id) => {
+      setPhase("processing");
+      setBackendStage(null);
+      setErrorMessage("");
+      setErrorStep(null);
+      setErrorCode(null);
+      try {
+        await api.startProcessing(id);
+      } catch (err) {
+        if (err.status === 409) {
+          // Already started (or completed) on the backend — just poll.
+        } else {
+          fail("process", err.message || "Failed to start processing.", err.status === 503 ? "ASR_NOT_CONFIGURED" : null);
+          return;
         }
       }
-    };
 
-    poll();
-    interval = setInterval(poll, STATUS_POLL_INTERVAL_MS);
-    pollStopRef.current = () => {
-      cancelled = true;
-      if (interval) clearInterval(interval);
-    };
+      const startedAt = Date.now();
+      let consecutiveErrors = 0;
 
-    return () => {
-      cancelled = true;
-      if (interval) clearInterval(interval);
-    };
-  }, [processing, uploadedVideo]);
+      const pollOnce = async () => {
+        try {
+          const status = await api.getJobStatus(id);
+          consecutiveErrors = 0;
+          if (cancelledRef.current) return;
 
-  const handleStartProcessing = async () => {
-    if (!uploadedVideo?.job_id) return;
+          if (status.status === "completed") {
+            // Subtitles already generated (e.g. a retried job) skip
+            // straight to the editor; otherwise romanize next.
+            if (status.subtitles_available) {
+              setPhase("redirecting");
+              setTimeout(() => {
+                if (!cancelledRef.current) navigate(`/editor/${id}`);
+              }, REDIRECT_DELAY_MS);
+            } else {
+              runRomanizationRef.current(id);
+            }
+            return;
+          }
+          if (status.status === "failed") {
+            fail(
+              "process",
+              status.error || "Processing failed. Please try again.",
+              status.error_code ?? null
+            );
+            return;
+          }
+          setBackendStage(status.status);
+          if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
+            fail("process", "Processing is taking too long. Please try again.", "TIMEOUT");
+            return;
+          }
+          scheduleNext();
+        } catch (err) {
+          consecutiveErrors += 1;
+          if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+            fail(
+              "process",
+              err.message || "Could not reach the server. Check that the backend is running.",
+              "NETWORK"
+            );
+            return;
+          }
+          scheduleNext();
+        }
+      };
 
-    setProcessing("starting");
-    setProcessingError("");
-    setProcessingErrorCode(null);
-    setTranscript(null);
+      const scheduleNext = () => {
+        if (!cancelledRef.current) {
+          setTimeout(pollOnce, STATUS_POLL_INTERVAL_MS);
+        }
+      };
 
-    try {
-      await api.startProcessing(uploadedVideo.job_id);
-      setProcessingStage("queued");
-      setProcessing("running");
-    } catch (error) {
-      if (error.status === 409) {
-        // Job already started (or completed) on the backend — resume polling.
-        setProcessingStage(null);
-        setProcessing("running");
-        return;
+      pollOnce();
+    },
+    [fail, navigate]
+  );
+
+  runProcessingRef.current = runProcessing;
+
+  // ------------------------------------------------------------------
+  // Stage 3 — romanization (+ English translation)
+  //
+  // The English translation is always generated alongside the romanized
+  // captions — no opt-in needed.
+  // ------------------------------------------------------------------
+  const runRomanization = useCallback(
+    async (id) => {
+      setPhase("romanizing");
+      setErrorMessage("");
+      setErrorStep(null);
+      setErrorCode(null);
+      try {
+        await api.romanize(id);
+        if (cancelledRef.current) return;
+        setPhase("redirecting");
+        setTimeout(() => {
+          if (!cancelledRef.current) navigate(`/editor/${id}`);
+        }, REDIRECT_DELAY_MS);
+      } catch (err) {
+        if (cancelledRef.current) return;
+        fail("romanize", err.message || "Failed to generate subtitles.");
       }
-      setProcessingErrorCode("START_FAILED");
-      setProcessingError(error.message || "Failed to start processing.");
-      setProcessing("failed");
-    }
-  };
+    },
+    [fail, navigate]
+  );
 
-  // Client-side failures (network, transcript fetch) only need re-polling;
-  // backend-side failures are restarted through POST /process.
-  const CLIENT_SIDE_ERROR_CODES = ["NETWORK", "TRANSCRIPT_FETCH", "TIMEOUT"];
-  const handleRetryProcessing = () => {
-    if (CLIENT_SIDE_ERROR_CODES.includes(processingErrorCode)) {
-      setProcessingError("");
-      setProcessingErrorCode(null);
-      setProcessing("running");
+  runRomanizationRef.current = runRomanization;
+
+  // ------------------------------------------------------------------
+  // Retry / start over
+  // ------------------------------------------------------------------
+  const handleRetry = useCallback(() => {
+    if (errorStep === "upload" && file) {
+      runUpload(file);
+    } else if (errorStep === "process" && jobId) {
+      runProcessing(jobId);
+    } else if (errorStep === "romanize" && jobId) {
+      runRomanization(jobId);
     } else {
-      handleStartProcessing();
+      reset();
     }
-  };
+  }, [errorStep, file, jobId, reset, runProcessing, runRomanization, runUpload]);
 
-  const showStartButton = uploadedVideo && processing === "idle";
-  const showTranscript = processing === "completed" && transcript;
+  const busy = phase !== "idle" && phase !== "error";
 
-  // Phase 3 — generate Romanized subtitles from the completed ASR transcript.
-  const handleRomanize = async () => {
-    if (!uploadedVideo?.job_id) return;
-    setRomanization("running");
-    setRomanError("");
-    setSubtitles(null);
+  // Format ISO date to a short relative string
+  const formatDate = (iso) => {
     try {
-      const data = await api.romanize(uploadedVideo.job_id, includeEnglish);
-      setSubtitles(data.subtitles ?? []);
-      setSubtitlesModel(data.model ?? null);
-      setShowEnglish(!!data.include_english);
-      setRomanization("done");
-    } catch (error) {
-      setRomanError(error.message || "Failed to generate subtitles.");
-      setRomanization("failed");
+      const d = new Date(iso);
+      return d.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return iso;
     }
   };
 
-  const phase3Status =
-    romanization === "running"
-      ? "romanizing"
-      : romanization === "done" && subtitles
-      ? "subtitles_ready"
-      : null;
-  const hasEnglish = (subtitles || []).some((s) => s.english_text);
+  // Status badge color
+  const statusBadge = (status) => {
+    const map = {
+      completed: "bg-emerald-500/15 text-emerald-400",
+      uploaded: "bg-yellow-500/15 text-yellow-400",
+      failed: "bg-red-500/15 text-red-400",
+      queued: "bg-blue-500/15 text-blue-400",
+      extracting_audio: "bg-blue-500/15 text-blue-400",
+      transcribing: "bg-blue-500/15 text-blue-400",
+    };
+    return map[status] || "bg-gray-500/15 text-gray-400";
+  };
 
+  // ------------------------------------------------------------------
+  // Render
+  // ------------------------------------------------------------------
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
-      {/* Header */}
-      <header className="border-b border-gray-800 py-8">
-        <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8">
-          <h1 className="text-4xl font-bold tracking-tight">TALAFUZ AI</h1>
-          <p className="text-gray-400 mt-2">
-            AI subtitles for South Asian short-form content.
-          </p>
+    <div className="min-h-screen flex flex-col bg-gray-950 text-white">
+      {/* Header — same chrome as the editor */}
+      <header className="h-14 shrink-0 flex items-center justify-between gap-3 px-4 border-b border-gray-800 bg-gray-900">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-7 h-7 rounded-lg bg-emerald-500 flex items-center justify-center text-gray-950 font-black text-xs shrink-0">
+            T
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-sm font-bold tracking-wide leading-tight">
+              TALAFUZ <span className="text-emerald-400">AI</span>
+            </h1>
+            <p className="text-[10px] text-gray-500 truncate">
+              AI subtitles for South Asian creators
+            </p>
+          </div>
         </div>
+        {busy && (
+          <span className="text-[11px] text-gray-500 hidden sm:block">
+            Hang tight — everything runs automatically
+          </span>
+        )}
       </header>
 
-      {/* Main content */}
-      <main className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-        <div className="space-y-8">
-          {/* Upload section */}
-          {!uploadedVideo && (
-            <div className="flex justify-center">
-              <VideoUploader
-                onVideoSelect={handleVideoSelect}
-                onUploadStart={handleUploadStart}
-                onUploadComplete={handleUploadComplete}
-                onError={handleError}
-              />
-            </div>
-          )}
+      <main className="flex-1 flex flex-col items-center gap-8 px-4 py-10">
+        {/* -------------------------------------------------------- */}
+        {/* Tab switcher (only when idle or error)                    */}
+        {/* -------------------------------------------------------- */}
+        {(phase === "idle" || phase === "error") && (
+          <div className="flex items-center gap-1 bg-gray-900 rounded-lg p-1 border border-gray-800">
+            <button
+              onClick={() => setTab("upload")}
+              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                tab === "upload"
+                  ? "bg-emerald-500 text-gray-950"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              Upload
+            </button>
+            <button
+              onClick={() => setTab("drafts")}
+              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                tab === "drafts"
+                  ? "bg-emerald-500 text-gray-950"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              Drafts
+              {drafts.length > 0 && tab !== "drafts" && (
+                <span className="bg-emerald-500/20 text-emerald-400 text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                  {drafts.length}
+                </span>
+              )}
+            </button>
+          </div>
+        )}
 
-          {/* Status messages */}
-          {(isError || uploadedVideo) && (
-            <div className="flex justify-center">
-              <ProcessingStatus
-                jobId={uploadedVideo?.job_id}
-                isSuccess={!!uploadedVideo}
-                isError={isError}
-                errorMessage={processing === "failed" ? processingError : errorMessage}
-                processingStatus={processing === "idle" ? null : processing}
-                processingStage={processingStage}
-                processingErrorCode={processingErrorCode}
-                phase3Status={phase3Status}
-              />
+        {/* -------------------------------------------------------- */}
+        {/* Upload tab                                                */}
+        {/* -------------------------------------------------------- */}
+        {phase === "idle" && tab === "upload" && (
+          <>
+            <div className="text-center max-w-xl">
+              <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">
+                Caption your video in one drop
+              </h2>
+              <p className="text-sm text-gray-400 mt-2 leading-relaxed">
+                Upload a clip and Talafuz transcribes the speech, romanizes it
+                and drops you straight into the caption editor — styled,
+                timed and export-ready.
+              </p>
             </div>
-          )}
+            <VideoDropzone onFile={handleFile} />
+          </>
+        )}
 
-          {/* Processing retry (not offered when ASR is simply not configured) */}
-          {processing === "failed" &&
-            processingErrorCode !== "ASR_NOT_CONFIGURED" &&
-            processingError && (
-              <div className="flex justify-center">
+        {/* -------------------------------------------------------- */}
+        {/* Drafts tab                                                */}
+        {/* -------------------------------------------------------- */}
+        {phase === "idle" && tab === "drafts" && (
+          <div className="w-full max-w-2xl">
+            {draftsLoading && (
+              <div className="text-center py-16">
+                <div className="inline-block w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+                <p className="text-sm text-gray-500 mt-3">Loading drafts…</p>
+              </div>
+            )}
+
+            {draftsError && !draftsLoading && (
+              <div className="text-center py-16">
+                <p className="text-sm text-red-400">{draftsError}</p>
                 <button
-                  onClick={handleRetryProcessing}
-                  className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition"
+                  onClick={fetchDrafts}
+                  className="mt-3 text-xs text-emerald-400 hover:underline"
                 >
-                  Retry Processing
+                  Try again
                 </button>
               </div>
             )}
 
-          {/* Video preview */}
-          {uploadedVideo && (
-            <div className="space-y-6">
-              <div className="flex justify-center">
-                <VideoPreview
-                  jobId={uploadedVideo.job_id}
-                  filename={uploadedVideo.filename}
-                />
-              </div>
-
-              {/* Start processing */}
-              {showStartButton && (
-                <div className="flex justify-center">
-                  <button
-                    onClick={handleStartProcessing}
-                    className="px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition"
-                  >
-                    Start Processing
-                  </button>
+            {!draftsLoading && !draftsError && drafts.length === 0 && (
+              <div className="text-center py-16">
+                <div className="w-14 h-14 mx-auto rounded-xl bg-gray-800 flex items-center justify-center mb-4">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-7 h-7 text-gray-600">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z" />
+                  </svg>
                 </div>
-              )}
-
-              {/* Transcript panel */}
-              {showTranscript && (
-                <div className="flex justify-center">
-                  <TranscriptPanel
-                    jobId={uploadedVideo.job_id}
-                    segments={transcript}
-                  />
-                </div>
-              )}
-
-              {/* Phase 3 — romanization controls */}
-              {showTranscript && romanization !== "running" && (
-                <div className="flex flex-col items-center gap-3">
-                  <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={includeEnglish}
-                      onChange={(e) => setIncludeEnglish(e.target.checked)}
-                      className="w-4 h-4 accent-blue-500"
-                    />
-                    Include English translation (optional)
-                  </label>
-                  <button
-                    onClick={handleRomanize}
-                    className="px-8 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition"
-                  >
-                    {romanization === "done"
-                      ? "Regenerate Roman Urdu Subtitles"
-                      : "Generate Roman Urdu Subtitles"}
-                  </button>
-                </div>
-              )}
-
-              {/* Phase 3 — romanization error */}
-              {romanization === "failed" && romanError && (
-                <div className="flex justify-center">
-                  <div className="w-full max-w-2xl bg-red-900 border border-red-700 rounded-lg p-4">
-                    <p className="text-red-200 font-medium">
-                      Subtitle generation failed
-                    </p>
-                    <p className="text-red-300 text-sm mt-1">{romanError}</p>
-                    <button
-                      onClick={handleRomanize}
-                      className="mt-3 px-4 py-1.5 bg-red-700 hover:bg-red-600 text-white text-sm font-medium rounded transition"
-                    >
-                      Retry
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Phase 3 — romanized subtitles (primary output) */}
-              {showTranscript && subtitles && romanization === "done" && (
-                <div className="flex justify-center">
-                  <SubtitlePanel
-                    subtitles={subtitles}
-                    hasEnglish={hasEnglish}
-                    showEnglish={showEnglish}
-                    onToggleEnglish={setShowEnglish}
-                  />
-                </div>
-              )}
-              {subtitlesModel && (
-                <p className="text-center text-xs text-gray-500">
-                  Romanization model: {subtitlesModel}
+                <h3 className="text-base font-semibold text-gray-300">No drafts yet</h3>
+                <p className="text-sm text-gray-500 mt-1">
+                  Upload a video and your work will be saved here automatically.
                 </p>
-              )}
-
-              {/* Phase 4 — Enter editor */}
-              {showTranscript && subtitles && romanization === "done" && (
-                <div className="flex justify-center">
-                  <button
-                    onClick={() => navigate(`/editor/${uploadedVideo.job_id}`)}
-                    className="px-8 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
-                  >
-                    Edit Subtitles & Export
-                  </button>
-                </div>
-              )}
-
-              {/* Reset button */}
-              <div className="flex justify-center">
                 <button
-                  onClick={handleReset}
-                  className="px-6 py-2 bg-gray-800 hover:bg-gray-700 text-white font-medium rounded-lg transition border border-gray-700"
+                  onClick={() => setTab("upload")}
+                  className="mt-4 px-4 py-2 bg-emerald-500 text-gray-950 text-sm font-medium rounded-lg hover:bg-emerald-400 transition-colors"
                 >
-                  Upload Another Video
+                  Upload a video
                 </button>
               </div>
-            </div>
-          )}
+            )}
 
-          {/* Error state with retry */}
-          {isError && !uploadedVideo && (
-            <div className="flex justify-center">
-              <button
-                onClick={handleReset}
-                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition"
-              >
-                Try Again
-              </button>
-            </div>
-          )}
-        </div>
+            {!draftsLoading && !draftsError && drafts.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-lg font-semibold">Saved drafts</h2>
+                  <button
+                    onClick={fetchDrafts}
+                    className="text-xs text-gray-500 hover:text-emerald-400 transition-colors"
+                  >
+                    Refresh
+                  </button>
+                </div>
+
+                {drafts.map((draft) => {
+                  const canEdit = draft.status === "completed" || draft.subtitles_saved;
+                  return (
+                    <div
+                      key={draft.job_id}
+                      className="group flex items-center gap-4 bg-gray-900 border border-gray-800 rounded-lg px-4 py-3 hover:border-gray-700 transition-colors"
+                    >
+                      {/* Video icon / thumbnail placeholder */}
+                      <div className="w-10 h-10 rounded-lg bg-gray-800 flex items-center justify-center shrink-0">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-5 h-5 text-gray-500">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z" />
+                        </svg>
+                      </div>
+
+                      {/* Info */}
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium truncate">
+                          {draft.video_filename || "Unknown video"}
+                        </p>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-[11px] text-gray-500">
+                            {formatDate(draft.created_at)}
+                          </span>
+                          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${statusBadge(draft.status)}`}>
+                            {draft.status}
+                          </span>
+                          {draft.subtitles_saved && (
+                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
+                              saved
+                            </span>
+                          )}
+                          {draft.has_export && (
+                            <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-purple-500/15 text-purple-400">
+                              exported
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Actions */}
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          onClick={() => handleEditDraft(draft.job_id)}
+                          disabled={!canEdit}
+                          className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                            canEdit
+                              ? "bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25"
+                              : "bg-gray-800 text-gray-600 cursor-not-allowed"
+                          }`}
+                          title={canEdit ? "Open in editor" : "Processing not complete"}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleDeleteDraft(draft.job_id)}
+                          disabled={deletingId === draft.job_id}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                        >
+                          {deletingId === draft.job_id ? "…" : "Delete"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* -------------------------------------------------------- */}
+        {/* Pipeline timeline (visible during processing)             */}
+        {/* -------------------------------------------------------- */}
+        {phase !== "idle" && (
+          <PipelineTimeline
+            fileName={fileName}
+            fileSizeMB={fileSizeMB}
+            jobId={jobId}
+            phase={phase}
+            stage={backendStage}
+            elapsedSeconds={elapsedSeconds}
+            errorMessage={errorMessage}
+            errorCode={errorCode}
+            errorStep={errorStep}
+            canRetry={errorCode !== "ASR_NOT_CONFIGURED"}
+            onRetry={handleRetry}
+            onStartOver={reset}
+          />
+        )}
+
+        {phase === "redirecting" && (
+          <p className="text-xs text-emerald-400 animate-pulse">
+            Opening the editor…
+          </p>
+        )}
       </main>
     </div>
   );

@@ -109,6 +109,10 @@ ROMANIZATION_MAX_TOKENS = int(os.getenv("ROMANIZATION_MAX_TOKENS", "8192"))
 # Subtitle segmentation targets (Phase 3)
 SUBTITLE_MAX_CHARS_PER_LINE = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", "42"))
 SUBTITLE_MAX_LINES = int(os.getenv("SUBTITLE_MAX_LINES", "2"))
+# Creator-style cue length: romanized segments are split into cues of at
+# most this many words (~3–5 word captions). SUBTITLE_MAX_CHARS_PER_LINE *
+# SUBTITLE_MAX_LINES stays the hard character ceiling.
+SUBTITLE_MAX_WORDS_PER_CUE = int(os.getenv("SUBTITLE_MAX_WORDS_PER_CUE", "5"))
 SUBTITLE_MIN_DURATION = float(os.getenv("SUBTITLE_MIN_DURATION", "0.8"))  # seconds
 
 # Legacy Alibaba Cloud access-key variables — kept for reference only;

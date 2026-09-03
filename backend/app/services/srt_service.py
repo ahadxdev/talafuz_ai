@@ -2,7 +2,8 @@
 Phase 4 — SRT export service.
 
 Converts subtitle data to valid SubRip (.srt) format with proper timestamp
-formatting and support for multiple modes (romanized, english, dual).
+formatting and support for multiple modes (romanized, english, dual,
+original).
 
 SRT format specification:
 - Sequence number (1-indexed)
@@ -63,10 +64,13 @@ def generate_srt(
             - end (float): end time in seconds
             - romanized_text (str): romanized text
             - english_text (str, optional): English translation
+            - original_text (str, optional): original ASR text
         mode (str): Display mode:
             - "romanized": show romanized_text only
             - "english": show english_text only
             - "dual": show romanized_text, then english_text on next line
+            - "original": show original ASR text (falls back to romanized
+              for user-added cues that have no transcript text)
 
     Returns:
         Valid SRT format as a string.
@@ -77,8 +81,10 @@ def generate_srt(
     if not subtitles:
         return ""
 
-    if mode not in ("romanized", "english", "dual"):
-        raise ValueError(f"Invalid mode: {mode}. Must be 'romanized', 'english', or 'dual'.")
+    if mode not in ("romanized", "english", "dual", "original"):
+        raise ValueError(
+            f"Invalid mode: {mode}. Must be 'romanized', 'english', 'dual', or 'original'."
+        )
 
     srt_lines = []
 
@@ -88,6 +94,7 @@ def generate_srt(
         end = subtitle.get("end", 0.0)
         romanized = subtitle.get("romanized_text", "")
         english = subtitle.get("english_text", "")
+        original = subtitle.get("original_text", "") or romanized
 
         # Validate
         if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
@@ -102,6 +109,10 @@ def generate_srt(
             if not romanized:
                 raise ValueError(f"Subtitle {idx}: romanized_text is missing or empty")
             text_content = romanized
+        elif mode == "original":
+            if not original:
+                raise ValueError(f"Subtitle {idx}: original_text is missing or empty")
+            text_content = original
         elif mode == "english":
             if not english:
                 raise ValueError(f"Subtitle {idx}: english_text is missing or empty for mode 'english'")

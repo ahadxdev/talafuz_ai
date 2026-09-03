@@ -156,3 +156,66 @@ export const IconDownload = (p) => (
     <path d="M12 15V3" />
   </Svg>
 );
+
+export const IconUpload = (p) => (
+  <Svg {...p}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <path d="m17 8-5-5-5 5" />
+    <path d="M12 3v12" />
+  </Svg>
+);
+
+export const IconCheck = (p) => (
+  <Svg {...p}>
+    <path d="M20 6 9 17l-5-5" />
+  </Svg>
+);
+
+export const IconRefresh = (p) => (
+  <Svg {...p}>
+    <path d="M3 12a9 9 0 0 1 15.36-6.36L21 8" />
+    <path d="M21 3v5h-5" />
+    <path d="M21 12a9 9 0 0 1-15.36 6.36L3 16" />
+    <path d="M3 21v-5h5" />
+  </Svg>
+);
+
+export const IconFilm = (p) => (
+  <Svg {...p}>
+    <rect x="2" y="4" width="20" height="16" rx="2" />
+    <path d="M7 4v16" />
+    <path d="M17 4v16" />
+    <path d="M2 9h5" />
+    <path d="M2 15h5" />
+    <path d="M17 9h5" />
+    <path d="M17 15h5" />
+  </Svg>
+);
+
+export const IconFileText = (p) => (
+  <Svg {...p}>
+    <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+    <path d="M14 2v5h6" />
+    <path d="M9 13h6" />
+    <path d="M9 17h4" />
+  </Svg>
+);
+
+export const IconChevronDown = (p) => (
+  <Svg {...p}>
+    <path d="m6 9 6 6 6-6" />
+  </Svg>
+);
+
+export const IconWand = (p) => (
+  <Svg {...p}>
+    <path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z" />
+    <path d="m14 7 3 3" />
+    <path d="M5 6v4" />
+    <path d="M19 14v4" />
+    <path d="M10 2v2" />
+    <path d="M7 8H3" />
+    <path d="M21 16h-4" />
+    <path d="M11 3H9" />
+  </Svg>
+);

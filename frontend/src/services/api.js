@@ -89,9 +89,9 @@ export const api = {
 
   /**
    * Phase 3 — generate Romanized subtitles from the ASR transcript.
-   * English translation is optional and generated separately.
+   * The English translation is always generated alongside romanization.
    */
-  async romanize(jobId, includeEnglish = false) {
+  async romanize(jobId, includeEnglish = true) {
     const response = await fetch(
       `${API_BASE_URL}/api/videos/${jobId}/romanize`,
       {
@@ -213,6 +213,39 @@ export const api = {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(data.detail || "Failed to fetch export status");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Drafts — list all saved jobs with metadata
+   */
+  async getDrafts() {
+    const response = await fetch(`${API_BASE_URL}/api/videos/drafts`);
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to fetch drafts");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  },
+
+  /**
+   * Drafts — delete a job and all its data
+   */
+  async deleteDraft(jobId) {
+    const response = await fetch(
+      `${API_BASE_URL}/api/videos/${jobId}`,
+      { method: "DELETE" }
+    );
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(data.detail || "Failed to delete job");
       error.status = response.status;
       throw error;
     }

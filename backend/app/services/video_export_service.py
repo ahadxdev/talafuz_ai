@@ -12,12 +12,18 @@ Style mapping notes (CSS preview -> ASS):
 - The caption box width becomes ASS side margins (the wrap width) with the
   anchor point shifted for left/right text alignment, mirroring the CSS
   overlay (box centered on posX, vertically centered on posY).
-- Word highlighting is rendered as karaoke fill (\kf): words light up as
-  they are spoken (the preview flashes only the active word).
+- Word highlighting emits one Dialogue event per word: exactly one word is
+  colour-overridden to the highlight colour at any moment (matching the
+  preview's single active word) instead of ASS karaoke, which would fill
+  words cumulatively and leave the whole line highlighted by the cue's end.
+  Event boundaries spread the cue across words in proportion to each word's
+  estimated speaking time (length + punctuation pauses) — the same
+  speech-weighted estimate the editor preview uses.
 - Backgrounds use BorderStyle=3 (opaque box); text outlines use
   BorderStyle=1. Only one can be burned in per ASS style, so a background
   wins when both are configured.
-- Entrance animations map to \fad / \t scale / \move effects.
+- Entrance animations map to \fad / \t scale / \move effects and are
+  applied once per cue (the first word event), not replayed per word.
 
 All FFmpeg invocation is isolated here; API routes never call FFmpeg
 directly. Exports run on a background thread — the HTTP request that starts
@@ -74,7 +80,7 @@ DEFAULT_CAPTION_STYLE: Dict[str, Any] = {
     "lineHeight": 1.2,
     "wordHighlight": True,
     "highlightColor": "#22C55E",
-    "boxWidth": 88.0,
+    "boxWidth": 95.0,
 }
 
 
@@ -162,6 +168,11 @@ def _ass_color(hex_color: Any, alpha: float = 0.0) -> str:
     return f"&H{a:02X}{b:02X}{g:02X}{r:02X}"
 
 
+def _ass_rgb(hex_color: Any) -> str:
+    """Convert '#RRGGBB' to an ASS &HBBGGRR colour for inline \\c overrides."""
+    return "&H" + _ass_color(hex_color)[-6:]
+
+
 def _ass_time(seconds: float) -> str:
     """Format seconds as ASS H:MM:SS.cc."""
     cs = max(0, round(float(seconds) * 100))
@@ -185,32 +196,96 @@ def _escape_ass_word(word: str) -> str:
     return word.replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def _karaoke_text(words: list, start: float, end: float) -> str:
-    r"""Attach \kf (karaoke fill) tags so words light up as they are spoken."""
-    total_cs = max(1, round((end - start) * 100))
-    n = len(words)
-    base = total_cs // n
-    remainder = total_cs - base * n
-    parts = []
-    for i, word in enumerate(words):
-        # The last word absorbs the rounding remainder.
-        duration = base + (remainder if i == n - 1 else 0)
-        parts.append("{\\kf%d}%s" % (max(1, duration), word))
-    return " ".join(parts)
+def _speech_weight(word: str) -> float:
+    """
+    Estimated speaking-time weight for one word: longer words take longer
+    to say, and trailing sentence/clause punctuation adds a natural pause.
+    Mirrors speechWeight() in the frontend subtitleUtils so the preview
+    highlight and the burn-in use identical timing.
+    """
+    weight = max(len(word), 1) + 2
+    if word[-1] in ".!?…":
+        weight += 5
+    elif word[-1] in ",;:—–":
+        weight += 3
+    return weight
 
 
-def _override_tags(ass_align: int, x: int, y: int, animation: str) -> str:
-    """Positioning + entrance-animation override block for one event."""
+def _word_events(words: list, start: float, end: float, text_rgb: str, highlight_rgb: str) -> list:
+    """
+    Build one Dialogue body per word: the active word is wrapped in an
+    inline \\c override to the highlight colour and restored afterwards, so
+    exactly one word is highlighted at a time (mirroring the preview).
+
+    Returns a list of (start_cs, end_cs, body) tuples with centisecond
+    boundaries from _word_timings.
+    """
+    boundaries = _word_timings(words, start, end)
+    events = []
+    for k, word in enumerate(words):
+        parts = []
+        for j, w in enumerate(words):
+            if j == k:
+                parts.append(f"{{\\c{highlight_rgb}}}{w}{{\\c{text_rgb}}}")
+            else:
+                parts.append(w)
+        events.append((boundaries[k], boundaries[k + 1], " ".join(parts)))
+    return events
+
+
+def _word_timings(words: list, start: float, end: float) -> list:
+    """
+    Centisecond event boundaries that split [start, end] across the words
+    in proportion to each word's estimated speaking time — longer words and
+    punctuation pauses get longer slots (the same speech-weighted estimate
+    the preview's active-word logic uses). The last word absorbs the
+    rounding remainder.
+    """
+    word_count = len(words)
+    start_cs = round(start * 100)
+    end_cs = round(end * 100)
+    span_cs = max(end_cs - start_cs, word_count)
+    weights = [_speech_weight(w) for w in words]
+    total = sum(weights)
+
+    boundaries = [start_cs]
+    cumulative = 0.0
+    for i, weight in enumerate(weights):
+        cumulative += weight
+        if i == word_count - 1:
+            boundaries.append(start_cs + span_cs)
+        else:
+            boundaries.append(start_cs + round(span_cs * cumulative / total))
+    boundaries[-1] = max(boundaries[-1], end_cs)  # keep the cue end exact
+    # Guard against rounding collapses (very fast cues): strictly increasing.
+    for i in range(1, len(boundaries)):
+        if boundaries[i] <= boundaries[i - 1]:
+            boundaries[i] = boundaries[i - 1] + 1
+    return boundaries
+
+
+def _override_tags(ass_align: int, x: int, y: int, animation: str, phase: str) -> str:
+    """
+    Positioning + entrance-animation override block for one event.
+
+    `phase` is "only" for single-event cues, or "first"/"mid"/"last" for
+    per-word events: entrance animations play once per cue (on the first
+    word event) instead of replaying on every word swap; a fade cue also
+    fades out on the last word event.
+    """
     tags = [f"\\an{ass_align}"]
-    if animation == "slide-up":
+    if animation == "slide-up" and phase == "first":
         tags.append(f"\\move({x},{y + 60},{x},{y},0,220)")
-    elif animation == "slide-down":
+    elif animation == "slide-down" and phase == "first":
         tags.append(f"\\move({x},{y - 60},{x},{y},0,220)")
     else:
         tags.append(f"\\pos({x},{y})")
     if animation == "fade":
-        tags.append("\\fad(200,150)")
-    elif animation == "pop":
+        fade_in = 200 if phase in ("first", "only") else 0
+        fade_out = 150 if phase in ("last", "only") else 0
+        if fade_in or fade_out:
+            tags.append(f"\\fad({fade_in},{fade_out})")
+    elif animation == "pop" and phase in ("first", "only"):
         tags.append("\\fscx70\\fscy70\\t(0,180,\\fscx100\\fscy100)")
     return "{" + "".join(tags) + "}"
 
@@ -243,14 +318,12 @@ def generate_ass_content(
     text_color = style.get("textColor", "#FFFFFF")
     highlight_color = style.get("highlightColor", "#22C55E")
 
-    if word_highlight:
-        # Karaoke fill: words start as the text colour and fill to the
-        # highlight colour as they are spoken.
-        primary = _ass_color(highlight_color)
-        secondary = _ass_color(text_color)
-    else:
-        primary = _ass_color(text_color)
-        secondary = _ass_color(text_color)
+    # PrimaryColour is the text colour; the highlighted word overrides it
+    # inline per event (see _word_events). SecondaryColour is unused.
+    primary = _ass_color(text_color)
+    secondary = _ass_color(text_color)
+    highlight_rgb = _ass_rgb(highlight_color)
+    text_rgb = _ass_rgb(text_color)
 
     background_opacity = min(1.0, max(0.0, float(style.get("backgroundOpacity", 0) or 0)))
     if background_opacity > 0:
@@ -336,15 +409,32 @@ def generate_ass_content(
         words = [_escape_ass_word(w) for w in text.split()]
         if not words:
             continue
-        if word_highlight:
-            body = _karaoke_text(words, start, end)
+
+        if word_highlight and len(words) > 1:
+            # One event per word: only the spoken word carries the highlight
+            # colour at any moment (entrance animation on the first event,
+            # fade-out on the last).
+            for k, (cs0, cs1, body) in enumerate(
+                _word_events(words, start, end, text_rgb, highlight_rgb)
+            ):
+                phase = "first" if k == 0 else "last" if k == len(words) - 1 else "mid"
+                override = _override_tags(ass_align, anchor_px, anchor_py, animation, phase)
+                lines.append(
+                    f"Dialogue: 0,{_ass_time(cs0 / 100)},{_ass_time(cs1 / 100)},"
+                    f"Caption,,0,0,0,,{override}{body}"
+                )
         else:
-            body = " ".join(words)
-        override = _override_tags(ass_align, anchor_px, anchor_py, animation)
-        lines.append(
-            f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,"
-            f"{override}{body}"
-        )
+            # Plain cue (or a single word, which stays highlighted for its
+            # whole duration — matching the preview's active-word estimate).
+            if word_highlight:
+                body = f"{{\\c{highlight_rgb}}}{words[0]}"
+            else:
+                body = " ".join(words)
+            override = _override_tags(ass_align, anchor_px, anchor_py, animation, "only")
+            lines.append(
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Caption,,0,0,0,,"
+                f"{override}{body}"
+            )
 
     return header + "\n".join(lines) + "\n"
 

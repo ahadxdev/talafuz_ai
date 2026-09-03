@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 from typing import Tuple, Optional
 from fastapi import UploadFile
-from ..config import JOBS_DIR, MAX_UPLOAD_SIZE, ALLOWED_VIDEO_EXTENSIONS
+from ..config import JOBS_DIR, MAX_UPLOAD_SIZE, ALLOWED_VIDEO_EXTENSIONS, EXPORTED_VIDEO_FILENAME
 
 
 class VideoService:
@@ -66,19 +66,24 @@ class VideoService:
     @staticmethod
     def get_video_path(job_id: str) -> Optional[Path]:
         """
-        Get the path to the video file for a job.
-        
+        Get the path to the uploaded video file for a job.
+    
         Returns:
             Path to video file or None if not found
         """
         job_dir = JOBS_DIR / job_id
-        
+    
         if not job_dir.exists():
             return None
-        
-        # Find the first video file in the job directory
+    
+        # Find the first video file in the job directory, skipping the
+        # caption burn-in export — it is a render output, not the upload,
+        # and would otherwise shadow the original video (and get deleted
+        # by the next export run).
         for ext in ALLOWED_VIDEO_EXTENSIONS:
             for file in job_dir.glob(f"*{ext}"):
+                if file.name == EXPORTED_VIDEO_FILENAME:
+                    continue
                 return file
-        
+    
         return None

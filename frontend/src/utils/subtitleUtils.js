@@ -94,6 +94,192 @@ export function mergeSubtitles(first, second) {
   };
 }
 
+/**
+ * Estimated speaking-time weight for one word: longer words take longer
+ * to say, and trailing sentence/clause punctuation adds a natural pause.
+ * Mirrors _speech_weight() in the backend video export so the preview
+ * highlight, cue splitting and burn-in all use identical timing.
+ */
+function speechWeight(word) {
+  let weight = Math.max(word.length, 1) + 2;
+  if (/[.!…]$/.test(word)) weight += 5;
+  else if (/[,;:—–]$/.test(word)) weight += 3;
+  return weight;
+}
+
+/**
+ * Distribute a text field's words across `chunkCount` pieces, proportional
+ * to each chunk's slot (some pieces can be empty for short fields).
+ */
+function splitFieldIntoChunks(text, chunkCount) {
+  const trimmed = (text || "").trim();
+  if (chunkCount <= 1) return [trimmed];
+  const words = trimmed ? trimmed.split(/\s+/).filter(Boolean) : [];
+  if (words.length === 0) return Array(chunkCount).fill("");
+  const pieces = [];
+  for (let k = 0; k < chunkCount; k += 1) {
+    const from = Math.round((words.length * k) / chunkCount);
+    const to =
+      k === chunkCount - 1
+        ? words.length
+        : Math.round((words.length * (k + 1)) / chunkCount);
+    pieces.push(words.slice(from, to).join(" "));
+  }
+  return pieces;
+}
+
+/**
+ * Re-segment captions into short, creator-style cues: every cue is split
+ * into word groups of at most `maxWords` words (and roughly `maxChars`
+ * characters), with the timing distributed in proportion to each piece's
+ * estimated speaking time (word length + punctuation pauses) — the same
+ * speech-weighted estimate the word-highlight preview uses.
+ *
+ * Pieces shorter than `minDuration` are merged with their smallest
+ * neighbour so fast cues don't collapse into unreadable flashes. All
+ * language fields are split proportionally by their own word counts;
+ * already-short cues are left untouched.
+ */
+export function shortenSubtitles(
+  subtitles,
+  { maxWords = 4, maxChars = 28, minDuration = 0.3 } = {}
+) {
+  const out = [];
+  for (const sub of subtitles || []) {
+    const words = (sub.romanized_text || "").trim().split(/\s+/).filter(Boolean);
+    const isShort =
+      words.length <= maxWords &&
+      words.join(" ").length <= maxChars;
+    if (isShort || words.length === 0) {
+      out.push(sub);
+      continue;
+    }
+
+    // Greedy word grouping.
+    const chunks = [];
+    let current = [];
+    for (const word of words) {
+      const next = current.length ? [...current, word] : [word];
+      if (
+        current.length &&
+        (next.length > maxWords || next.join(" ").length > maxChars)
+      ) {
+        chunks.push(current);
+        current = [word];
+      } else {
+        current = next;
+      }
+    }
+    if (current.length) chunks.push(current);
+
+    // Merge the smallest adjacent groups while pieces would be too short.
+    const duration = sub.end - sub.start;
+    while (chunks.length > 1 && duration / chunks.length < minDuration) {
+      let best = 0;
+      let bestSize = Infinity;
+      for (let i = 0; i < chunks.length - 1; i += 1) {
+        const size = chunks[i].length + chunks[i + 1].length;
+        if (size < bestSize) {
+          bestSize = size;
+          best = i;
+        }
+      }
+      chunks.splice(best, 2, [...chunks[best], ...chunks[best + 1]]);
+    }
+
+    if (chunks.length <= 1) {
+      out.push(sub);
+      continue;
+    }
+
+    // Timing: boundaries proportional to the cumulative estimated speaking
+    // time of each chunk's words, so cue splits and word highlighting stay
+    // in sync with each other.
+    const romPieces = chunks.map((c) => c.join(" "));
+    const engPieces = splitFieldIntoChunks(sub.english_text, chunks.length);
+    const origPieces = splitFieldIntoChunks(sub.original_text, chunks.length);
+    const weights = words.map(speechWeight);
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    const round3 = (v) => Number(v.toFixed(3));
+    let weightCursor = 0;
+    let wordCursor = 0;
+    let start = sub.start;
+    for (let i = 0; i < chunks.length; i += 1) {
+      const isLast = i === chunks.length - 1;
+      for (let k = 0; k < chunks[i].length; k += 1) {
+        weightCursor += weights[wordCursor];
+        wordCursor += 1;
+      }
+      const boundary = isLast
+        ? sub.end
+        : sub.start + (duration * weightCursor) / totalWeight;
+      out.push({
+        ...sub,
+        start: round3(start),
+        end: round3(boundary),
+        romanized_text: romPieces[i],
+        english_text: engPieces[i] || null,
+        original_text: origPieces[i],
+        words: undefined, // word timestamps no longer line up after splitting
+      });
+      start = boundary;
+    }
+  }
+  return resequenceSubtitles(out);
+}
+
+/** Length ceilings for "sentence" re-segmentation mode. */
+const SENTENCE_MAX_WORDS = 14;
+const SENTENCE_MAX_CHARS = 84;
+
+/**
+ * Merge short cues back into sentence-length cues: cues accumulate until
+ * the romanized text ends a sentence (. ! ? … ।) or the group hits the
+ * length ceiling. All language fields merge together.
+ */
+function mergeIntoSentences(subtitles) {
+  const out = [];
+  let group = null;
+  for (const sub of subtitles || []) {
+    group = group ? mergeSubtitles(group, sub) : { ...sub };
+    const text = (group.romanized_text || "").trim();
+    const wordCount = text ? text.split(/\s+/).length : 0;
+    const endsSentence = /[.!…।]$/.test(
+      (sub.romanized_text || "").trim()
+    );
+    if (
+      endsSentence ||
+      wordCount >= SENTENCE_MAX_WORDS ||
+      text.length >= SENTENCE_MAX_CHARS
+    ) {
+      out.push(group);
+      group = null;
+    }
+  }
+  if (group) out.push(group);
+  return resequenceSubtitles(out);
+}
+
+/**
+ * Re-segment every caption into the requested length mode:
+ *   "word"     — one word per caption (pop-caption style)
+ *   "short"    — 3–5 word groups (creator style, the default)
+ *   "sentence" — full sentence-length cues
+ *
+ * Timing follows the estimated speaking time of each piece, so the word
+ * highlight stays in sync after re-segmentation. Treat the result as one
+ * undoable editor step.
+ */
+export function resegmentSubtitles(subtitles, mode = "sentence") {
+  if (mode === "word") {
+    return shortenSubtitles(subtitles, { maxWords: 1, minDuration: 0 });
+  }
+  if (mode === "sentence") {
+    return mergeIntoSentences(subtitles);
+  }
+  return shortenSubtitles(subtitles, { maxWords: 5, maxChars: 42 });
+}
+
 /** Blank cue inserted after `subtitle` (or at the start when null). */
 export function createSubtitleAfter(subtitle, duration) {
   const fallbackEnd = (subtitle ? subtitle.end : 0) + 2;
@@ -117,9 +303,11 @@ export function createSubtitleAfter(subtitle, duration) {
  * Index of the word that should be highlighted at `time`.
  *
  * Real word-level timestamps (`subtitle.words`, a future ASR upgrade) always
- * take precedence. Without them the active word is estimated by distributing
- * the words evenly across the cue — a display-only estimate that is never
- * persisted or exported as subtitle data.
+ * take precedence. Without them the active word is estimated by spreading
+ * the cue across its words in proportion to each word's estimated speaking
+ * time — longer words and punctuation pauses hold the highlight longer,
+ * matching how the words are actually spoken. This is a display-only
+ * estimate that is never persisted or exported as subtitle data.
  */
 export function getActiveWordIndex(words, subtitle, time) {
   if (!subtitle || !Array.isArray(words) || words.length === 0) return -1;
@@ -134,8 +322,16 @@ export function getActiveWordIndex(words, subtitle, time) {
     return realWords.length - 1;
   }
   const span = Math.max(subtitle.end - subtitle.start, 0.001);
-  const ratio = Math.min(Math.max((time - subtitle.start) / span, 0), 0.999);
-  return Math.floor(ratio * words.length);
+  const ratio = Math.min(Math.max((time - subtitle.start) / span, 0), 1);
+  const weights = words.map(speechWeight);
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  const target = ratio * total;
+  let cumulative = 0;
+  for (let i = 0; i < words.length; i += 1) {
+    cumulative += weights[i];
+    if (target < cumulative) return i;
+  }
+  return words.length - 1;
 }
 
 /** Ids of subtitles matching `query` across any language field, or null. */

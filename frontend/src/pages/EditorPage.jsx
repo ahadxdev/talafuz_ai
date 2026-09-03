@@ -6,7 +6,9 @@ import { Timeline } from "../components/editor/Timeline";
 import { StylePanel } from "../components/editor/StylePanel";
 import {
   IconArrowLeft,
+  IconChevronDown,
   IconDownload,
+  IconFileText,
   IconRedo,
   IconSave,
   IconUndo,
@@ -22,6 +24,7 @@ import {
   hasEnglishTranslations,
   mergeSubtitles,
   resequenceSubtitles,
+  resegmentSubtitles,
   searchSubtitles,
   splitSubtitleAt,
   validateSubtitlesForSave,
@@ -43,6 +46,13 @@ import {
 const DRAFT_PREFIX = "talafuz_editor_";
 const DRAFT_DEBOUNCE_MS = 400;
 const TOAST_TIMEOUT_MS = 3500;
+
+const SRT_MODES = [
+  { value: "romanized", label: "Romanized" },
+  { value: "english", label: "English", needsEnglish: true },
+  { value: "dual", label: "Dual (Roman + English)", needsEnglish: true },
+  { value: "original", label: "Original (ASR text)" },
+];
 
 function loadDraft(jobId) {
   try {
@@ -74,6 +84,8 @@ export function EditorPage() {
   const [showSafeZone, setShowSafeZone] = useState(false);
   const [saveState, setSaveState] = useState("idle"); // idle | saving | saved
   const [exportState, setExportState] = useState("idle"); // idle | exporting | downloading
+  const [srtMenuOpen, setSrtMenuOpen] = useState(false);
+  const [srtState, setSrtState] = useState("idle"); // idle | exporting
   const [toast, setToast] = useState(null);
 
   const editor = useEditorHistory({
@@ -117,11 +129,29 @@ export function EditorPage() {
       try {
         const data = await api.getSubtitles(jobId);
         if (cancelled) return;
+        const loadedSubs = data.subtitles || [];
         reset({
-          subtitles: data.subtitles || [],
+          subtitles: loadedSubs,
           language: data.language || "romanized",
           style: mergeCaptionStyle(data.style),
         });
+        // Auto-segment long cues into 3–5 word groups on the first load so
+        // the default matches the creator-style short cues and the word
+        // highlight stays in sync with the estimated speech timing.
+        const hasLongCue = loadedSubs.some((s) => {
+          const wc = ((s.romanized_text || "").trim().split(/\s+/).filter(Boolean)).length;
+          return wc > 5;
+        });
+        if (hasLongCue && loadedSubs.length > 0) {
+          update((doc) => ({
+            ...doc,
+            subtitles: resegmentSubtitles(doc.subtitles, "short"),
+          }));
+          setToast({
+            type: "info",
+            text: "Captions auto-segmented into short 3\u20135 word groups \u2014 Ctrl+Z to undo.",
+          });
+        }
         setStatus("ready");
       } catch (err) {
         if (cancelled) return;
@@ -438,6 +468,49 @@ export function EditorPage() {
     }
   }, [exportState, jobId, subtitles, language, style]);
 
+  const handleResegment = useCallback(
+    (mode) => {
+      update((doc) => ({
+        ...doc,
+        subtitles: resegmentSubtitles(doc.subtitles, mode),
+      }));
+      setToast({
+        type: "info",
+        text:
+          mode === "word"
+            ? "One word per caption — Ctrl+Z undoes it."
+            : mode === "sentence"
+            ? "Captions merged into sentence-length cues — Ctrl+Z undoes it."
+            : "Captions split into short 3–5 word segments — Ctrl+Z undoes it.",
+      });
+    },
+    [update]
+  );
+
+  const handleExportSRT = useCallback(
+    async (mode) => {
+      if (srtState !== "idle") return;
+      const problem = validateSubtitlesForSave(subtitles);
+      if (problem) {
+        setToast({ type: "error", text: problem });
+        return;
+      }
+      setSrtMenuOpen(false);
+      setSrtState("exporting");
+      try {
+        // Persist the current editor state so the file matches the screen.
+        await api.saveSubtitles(jobId, subtitles, { language, style });
+        await api.exportSRT(jobId, mode);
+        setToast({ type: "info", text: `SRT (${mode}) downloaded.` });
+      } catch (err) {
+        setToast({ type: "error", text: err.message || "SRT export failed." });
+      } finally {
+        setSrtState("idle");
+      }
+    },
+    [srtState, jobId, subtitles, language, style]
+  );
+
   const handleDiscardDraft = useCallback(async () => {
     try {
       localStorage.removeItem(DRAFT_PREFIX + jobId);
@@ -610,6 +683,56 @@ export function EditorPage() {
             <IconRedo size={15} />
           </button>
 
+          {/* SRT export menu */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setSrtMenuOpen((v) => !v)}
+              disabled={srtState !== "idle"}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition bg-gray-800 border border-gray-700 text-gray-200 hover:bg-gray-700 disabled:opacity-60 disabled:cursor-not-allowed"
+              title="Download subtitles as an SRT file"
+            >
+              {srtState === "exporting" ? (
+                <span className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <IconFileText size={14} />
+              )}
+              SRT
+              <IconChevronDown size={12} />
+            </button>
+            {srtMenuOpen && (
+              <>
+                <button
+                  type="button"
+                  aria-label="Close menu"
+                  className="fixed inset-0 z-40 cursor-default"
+                  onClick={() => setSrtMenuOpen(false)}
+                />
+                <div className="absolute right-0 top-full mt-1.5 z-50 w-52 bg-gray-900 border border-gray-700 rounded-lg shadow-xl py-1">
+                  {SRT_MODES.map((m) => {
+                    const disabled = m.needsEnglish && !hasEnglish;
+                    return (
+                      <button
+                        key={m.value}
+                        type="button"
+                        disabled={disabled}
+                        onClick={() => handleExportSRT(m.value)}
+                        title={
+                          disabled
+                            ? "No English translations were generated for this job"
+                            : `Download ${m.label} SRT`
+                        }
+                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-gray-800 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {m.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+
           <button
             type="button"
             onClick={handleDownloadVideo}
@@ -669,6 +792,7 @@ export function EditorPage() {
           onDelete={handleDelete}
           onSplit={handleSplit}
           onMerge={handleMerge}
+          onResegment={handleResegment}
         />
 
         <section className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
