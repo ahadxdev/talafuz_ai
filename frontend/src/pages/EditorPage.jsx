@@ -46,6 +46,11 @@ import {
 const DRAFT_PREFIX = "talafuz_editor_";
 const DRAFT_DEBOUNCE_MS = 400;
 const TOAST_TIMEOUT_MS = 3500;
+const PANEL_WIDTH_KEY = "talafuz_panel_widths";
+const DEFAULT_LEFT_W = 340;
+const DEFAULT_RIGHT_W = 320;
+const MIN_PANEL_W = 220;
+const MAX_PANEL_W = 520;
 
 const SRT_MODES = [
   { value: "romanized", label: "Romanized" },
@@ -87,6 +92,29 @@ export function EditorPage() {
   const [srtMenuOpen, setSrtMenuOpen] = useState(false);
   const [srtState, setSrtState] = useState("idle"); // idle | exporting
   const [toast, setToast] = useState(null);
+
+  // Resizable panel widths
+  const [leftWidth, setLeftWidth] = useState(() => {
+    try {
+      const saved = localStorage.getItem(PANEL_WIDTH_KEY);
+      if (saved) {
+        const w = JSON.parse(saved);
+        return w.left || DEFAULT_LEFT_W;
+      }
+    } catch { /* ignore */ }
+    return DEFAULT_LEFT_W;
+  });
+  const [rightWidth, setRightWidth] = useState(() => {
+    try {
+      const saved = localStorage.getItem(PANEL_WIDTH_KEY);
+      if (saved) {
+        const w = JSON.parse(saved);
+        return w.right || DEFAULT_RIGHT_W;
+      }
+    } catch { /* ignore */ }
+    return DEFAULT_RIGHT_W;
+  });
+  const resizingRef = useRef(null); // { side: 'left'|'right', startX, startWidth }
 
   const editor = useEditorHistory({
     subtitles: [],
@@ -542,6 +570,51 @@ export function EditorPage() {
   }, [toast]);
 
   // ------------------------------------------------------------------
+  // Resizable panels — mouse drag handlers
+  // ------------------------------------------------------------------
+  const handleResizeStart = useCallback((side, e) => {
+    e.preventDefault();
+    resizingRef.current = {
+      side,
+      startX: e.clientX,
+      startWidth: side === "left" ? leftWidth : rightWidth,
+    };
+    const onMove = (ev) => {
+      const r = resizingRef.current;
+      if (!r) return;
+      const delta = ev.clientX - r.startX;
+      const newWidth =
+        r.side === "left"
+          ? r.startWidth + delta
+          : r.startWidth - delta;
+      const clamped = Math.min(MAX_PANEL_W, Math.max(MIN_PANEL_W, newWidth));
+      if (r.side === "left") setLeftWidth(clamped);
+      else setRightWidth(clamped);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      resizingRef.current = null;
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [leftWidth, rightWidth]);
+
+  // Persist panel widths to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        PANEL_WIDTH_KEY,
+        JSON.stringify({ left: leftWidth, right: rightWidth })
+      );
+    } catch { /* ignore */ }
+  }, [leftWidth, rightWidth]);
+
+  // ------------------------------------------------------------------
   // Keyboard shortcuts
   // ------------------------------------------------------------------
   useEffect(() => {
@@ -772,30 +845,41 @@ export function EditorPage() {
       </header>
 
       {/* Workspace */}
-      <main className="flex-1 min-h-0 flex flex-col lg:flex-row gap-3 p-3 overflow-y-auto lg:overflow-hidden">
-        <SubtitleList
-          className="w-full lg:w-[340px] shrink-0 h-[420px] lg:h-auto"
-          subtitles={subtitles}
-          language={language}
-          activeSubtitleId={activeSubtitle?.id ?? null}
-          selectedId={selectedId}
-          query={searchQuery}
-          onQueryChange={setSearchQuery}
-          matchIds={matchIds}
-          hasSelection={hasSelection}
-          canSplit={canSplit}
-          canMerge={canMerge}
-          onSelect={handleSelect}
-          onEditText={handleEditText}
-          onEditCommit={endInteraction}
-          onAdd={handleAdd}
-          onDelete={handleDelete}
-          onSplit={handleSplit}
-          onMerge={handleMerge}
-          onResegment={handleResegment}
-        />
+      <main className="flex-1 min-h-0 flex flex-col lg:flex-row gap-0 p-3 overflow-y-auto lg:overflow-hidden">
+        <div className="shrink-0 h-[420px] lg:h-auto" style={{ width: leftWidth }}>
+          <SubtitleList
+            className="h-full w-full"
+            subtitles={subtitles}
+            language={language}
+            activeSubtitleId={activeSubtitle?.id ?? null}
+            selectedId={selectedId}
+            query={searchQuery}
+            onQueryChange={setSearchQuery}
+            matchIds={matchIds}
+            hasSelection={hasSelection}
+            canSplit={canSplit}
+            canMerge={canMerge}
+            onSelect={handleSelect}
+            onEditText={handleEditText}
+            onEditCommit={endInteraction}
+            onAdd={handleAdd}
+            onDelete={handleDelete}
+            onSplit={handleSplit}
+            onMerge={handleMerge}
+            onResegment={handleResegment}
+          />
+        </div>
 
-        <section className="flex-1 min-w-0 min-h-0 flex flex-col gap-3">
+        {/* Left resize handle */}
+        <div
+          className="hidden lg:flex shrink-0 w-2 cursor-col-resize items-center justify-center group hover:bg-gray-800/50 transition-colors rounded mx-0.5"
+          onMouseDown={(e) => handleResizeStart("left", e)}
+          title="Drag to resize"
+        >
+          <div className="w-0.5 h-8 rounded-full bg-gray-700 group-hover:bg-emerald-500/60 transition-colors" />
+        </div>
+
+        <section className="flex-1 min-w-0 min-h-0 flex flex-col gap-3 mx-2">
           <VideoStage
             ref={playerRef}
             videoUrl={api.getVideoUrl(jobId)}
@@ -816,21 +900,33 @@ export function EditorPage() {
             onSeek={handleSeek}
             onSelect={(sub) => setSelectedId(sub.id)}
             onTrim={handleTrim}
+            onSplitAtPlayhead={handleSplit}
           />
         </section>
 
-        <StylePanel
-          className="w-full lg:w-[320px] shrink-0 h-[520px] lg:h-auto"
-          style={style}
-          onStyleChange={handleStyleChange}
-          onStyleCommit={endInteraction}
-          selectedSubtitle={selectedSubtitle}
-          language={language}
-          onEditText={handleEditText}
-          onEditCommit={endInteraction}
-          showSafeZone={showSafeZone}
-          onToggleSafeZone={setShowSafeZone}
-        />
+        {/* Right resize handle */}
+        <div
+          className="hidden lg:flex shrink-0 w-2 cursor-col-resize items-center justify-center group hover:bg-gray-800/50 transition-colors rounded mx-0.5"
+          onMouseDown={(e) => handleResizeStart("right", e)}
+          title="Drag to resize"
+        >
+          <div className="w-0.5 h-8 rounded-full bg-gray-700 group-hover:bg-emerald-500/60 transition-colors" />
+        </div>
+
+        <div className="shrink-0 h-[520px] lg:h-auto" style={{ width: rightWidth }}>
+          <StylePanel
+            className="h-full w-full"
+            style={style}
+            onStyleChange={handleStyleChange}
+            onStyleCommit={endInteraction}
+            selectedSubtitle={selectedSubtitle}
+            language={language}
+            onEditText={handleEditText}
+            onEditCommit={endInteraction}
+            showSafeZone={showSafeZone}
+            onToggleSafeZone={setShowSafeZone}
+          />
+        </div>
       </main>
 
       {/* Local draft indicator */}

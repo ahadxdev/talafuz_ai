@@ -57,10 +57,11 @@ export function CaptionOverlay({
       {words.length > 0 && subtitle && (
         <div
           key={subtitle.id}
-          className={`!w-full absolute ${animClass}`}
+          className={`absolute ${animClass}`}
           style={{
             left: `${style.posX}%`,
             top: `${style.posY}%`,
+            width: "100%",
             maxWidth: `${style.boxWidth ?? 95}%`,            
             transform: "translate(-50%, -50%)",
             textAlign: style.alignment,
