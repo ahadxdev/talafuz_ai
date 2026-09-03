@@ -172,6 +172,94 @@ const sentenced2 = resegmentSubtitles(multiCues, "sentence");
 check("resegment sentence multi cue 1", sentenced2[0].romanized_text, "yeh kaam ho gaya.");
 check("resegment sentence multi cue 2", sentenced2[1].romanized_text, "ab agla step shuru karte hain.");
 
+// ---------------------------------------------------------------------------
+// Word-level timing (subtitle.words) — real audio-derived timings drive the
+// highlight, split, merge and re-segment; anything stale/mismatched falls back
+// to the speech-weighted estimate (never passed off as real).
+// ---------------------------------------------------------------------------
+
+// Non-uniform real timings that clearly differ from the proportional estimate.
+const realCue = {
+  id: 1, start: 0, end: 4, romanized_text: "Agar main AI parhna",
+  original_text: "x", english_text: null,
+  words: [
+    { word: "Agar", start: 0, end: 3.0 },
+    { word: "main", start: 3.0, end: 3.3 },
+    { word: "AI", start: 3.3, end: 3.6 },
+    { word: "parhna", start: 3.6, end: 4.0 },
+  ],
+};
+const realTokens = ["Agar", "main", "AI", "parhna"];
+// Proportional would give index 1 at t=1.0; the real timings give 0.
+check("realWords take precedence", getActiveWordIndex(realTokens, realCue, 1.0), 0);
+check("realWords active 1", getActiveWordIndex(realTokens, realCue, 3.1), 1);
+check("realWords active 2", getActiveWordIndex(realTokens, realCue, 3.4), 2);
+check("realWords active 3", getActiveWordIndex(realTokens, realCue, 3.8), 3);
+check("realWords before first", getActiveWordIndex(realTokens, realCue, -1), 0);
+check("realWords after last", getActiveWordIndex(realTokens, realCue, 5), 3);
+
+// Token mismatch → not aligned → proportional fallback (index 1 at t=1.0).
+const mismatchCue = { ...realCue, words: [{ word: "XX", start: 0, end: 3.0 }, ...realCue.words.slice(1)] };
+check("realWords fallback on token mismatch", getActiveWordIndex(realTokens, mismatchCue, 1.0), 1);
+// Count mismatch → proportional fallback.
+const countCue = { ...realCue, words: [{ word: "Agar", start: 0, end: 2 }, { word: "main", start: 2, end: 4 }] };
+check("realWords fallback on count mismatch", getActiveWordIndex(realTokens, countCue, 1.0), 1);
+// Legacy timings without a .word field still drive the highlight by position.
+const legacyCue = { ...sub, words: [{ start: 0, end: 3 }, { start: 3, end: 3.3 }, { start: 3.3, end: 3.6 }, { start: 3.6, end: 4 }] };
+check("realWords legacy without word field", getActiveWordIndex(words4, legacyCue, 1.0), 0);
+
+// Uniform real timings for the structural operations below.
+const uniformCue = {
+  id: 1, start: 0, end: 4, romanized_text: "Agar main AI parhna",
+  original_text: "x", english_text: null,
+  words: [
+    { word: "Agar", start: 0, end: 1 }, { word: "main", start: 1, end: 2 },
+    { word: "AI", start: 2, end: 3 }, { word: "parhna", start: 3, end: 4 },
+  ],
+};
+// Split at a clean word boundary → each half keeps its own real timings.
+const [ra, rb] = splitSubtitleAt(uniformCue, 2);
+check("split real first words", ra.words.map((w) => w.word), ["Agar", "main"]);
+check("split real second words", rb.words.map((w) => w.word), ["AI", "parhna"]);
+check("split real first timing", [ra.start, ra.end], [0, 2]);
+check("split real second timing", [rb.start, rb.end], [2, 4]);
+// Split a cue without real timings → halves carry none (null), estimate only.
+const [na, nb] = splitSubtitleAt(sub, 2);
+check("split no words first", na.words, null);
+check("split no words second", nb.words, null);
+
+// Merge two cues that both carry valid real timings → concatenated in order.
+const mA = { id: 1, start: 0, end: 2, romanized_text: "Agar main", original_text: "x", english_text: null, words: [{ word: "Agar", start: 0, end: 1 }, { word: "main", start: 1, end: 2 }] };
+const mB = { id: 2, start: 2, end: 4, romanized_text: "AI parhna", original_text: "y", english_text: null, words: [{ word: "AI", start: 2, end: 3 }, { word: "parhna", start: 3, end: 4 }] };
+const mAB = mergeSubtitles(mA, mB);
+check("merge real words concat", mAB.words.map((w) => w.word), ["Agar", "main", "AI", "parhna"]);
+check("merge real words timing", [mAB.start, mAB.end], [0, 4]);
+// Merge where one cue lacks real timings → merged cue carries none.
+const mC = { id: 2, start: 2, end: 4, romanized_text: "AI parhna", original_text: "y", english_text: null };
+check("merge missing words undefined", mergeSubtitles(mA, mC).words, undefined);
+
+// Re-segment (shorten) a long cue with real timings → each chunk inherits its
+// own slice and its window comes from those real timings.
+const longReal = {
+  id: 1, start: 0, end: 8, romanized_text: "ek do teen chaar paanch cheh saat aath",
+  original_text: "x", english_text: null,
+  words: [
+    { word: "ek", start: 0, end: 1 }, { word: "do", start: 1, end: 2 },
+    { word: "teen", start: 2, end: 3 }, { word: "chaar", start: 3, end: 4 },
+    { word: "paanch", start: 4, end: 5 }, { word: "cheh", start: 5, end: 6 },
+    { word: "saat", start: 6, end: 7 }, { word: "aath", start: 7, end: 8 },
+  ],
+};
+const shortReal = shortenSubtitles([longReal], { maxWords: 4, maxChars: 40 });
+check("shorten real count", shortReal.length, 2);
+check("shorten real chunk1 words", shortReal[0].words.map((w) => w.word), ["ek", "do", "teen", "chaar"]);
+check("shorten real chunk2 words", shortReal[1].words.map((w) => w.word), ["paanch", "cheh", "saat", "aath"]);
+check("shorten real chunk1 timing", [shortReal[0].start, shortReal[0].end], [0, 4]);
+check("shorten real chunk2 timing", [shortReal[1].start, shortReal[1].end], [4, 8]);
+// Stale real timings (don't match tokens) → chunks fall back to the estimate.
+const staleReal = { ...longReal, words: [{ word: "XX", start: 0, end: 8 }] };
+check("shorten stale words undefined", shortenSubtitles([staleReal], { maxWords: 4, maxChars: 40 })[0].words, undefined);
+
 if (failed) {
   console.log(`\n${failed} CHECK(S) FAILED`);
   process.exit(1);

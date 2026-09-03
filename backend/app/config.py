@@ -114,6 +114,94 @@ SUBTITLE_MAX_LINES = int(os.getenv("SUBTITLE_MAX_LINES", "2"))
 # SUBTITLE_MAX_LINES stays the hard character ceiling.
 SUBTITLE_MAX_WORDS_PER_CUE = int(os.getenv("SUBTITLE_MAX_WORDS_PER_CUE", "5"))
 SUBTITLE_MIN_DURATION = float(os.getenv("SUBTITLE_MIN_DURATION", "0.8"))  # seconds
+# Hard cap for a single subtitle cue (seconds). Used by the audio alignment
+# layer so one cue never spans an excessively long stretch of speech.
+SUBTITLE_MAX_DURATION = float(os.getenv("SUBTITLE_MAX_DURATION", "6.0"))
+
+# ---------------------------------------------------------------------------
+# Subtitle timing alignment — local audio VAD (FFmpeg silencedetect)
+#
+# Qwen3-ASR filetrans returns SENTENCE-level timestamps only. Long sentences
+# are split into several cues; instead of distributing the whole sentence
+# duration proportionally (which spans real pauses and overlaps boundary
+# cues), the alignment service detects speech/silence inside each ASR
+# segment from the already-extracted audio.wav and places cues inside
+# detected speech regions. Everything runs locally through the existing
+# FFmpeg dependency — no extra cloud API key, no heavy ML dependency.
+# Any failure falls back to the proportional distributor.
+# ---------------------------------------------------------------------------
+SUBTITLE_ALIGNMENT_ENABLED = os.getenv("SUBTITLE_ALIGNMENT_ENABLED", "true").strip().lower() == "true"
+# FFmpeg silencedetect noise floor in dB: audio below this level is silence.
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "-35"))
+# Speech regions shorter than this are discarded as false positives (seconds).
+VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.15"))
+# Silence must last at least this long to count as a meaningful pause
+# (seconds). Shorter gaps are merged into the surrounding speech region.
+VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.4"))
+# Padding added around each detected speech region (seconds).
+VAD_PADDING = float(os.getenv("VAD_PADDING", "0.05"))
+# Timeout for one FFmpeg silence-analysis pass (seconds).
+VAD_TIMEOUT = int(os.getenv("VAD_TIMEOUT", "300"))
+
+# ---------------------------------------------------------------------------
+# Word-level timing alignment — local whisper.cpp (pywhispercpp) DTW
+#
+# Qwen3-ASR gives SENTENCE-level timestamps and the VAD layer above refines
+# them to CUE-level timing, but neither provides WORD-level timing. Without
+# it the editor highlight (subtitleUtils.getActiveWordIndex) and the burn-in
+# (video_export_service._word_timings) ESTIMATE each word's slot from its
+# character length, so the highlight lags behind the spoken word.
+#
+# This layer produces REAL audio-derived word timings, fully offline:
+# whisper.cpp transcribes the already-extracted audio.wav ONCE per job with
+# DTW token timestamps (biased toward the known romanized transcript via
+# initial_prompt so it "reads along" the real words); the recognised tokens
+# are matched to the cue words with an order-preserving character alignment
+# and the matched acoustic times are fitted into each cue window. No cloud
+# call and no torch — a ~147 MB ggml model on CPU.
+#
+# Honesty / gating: word timings are persisted ONLY for cues that pass a
+# strict quality gate. Every other cue keeps words=None and falls back to the
+# existing proportional estimate — estimated timings are never presented or
+# stored as real audio-derived word timings. This is recognition + matching
+# (like WhisperX), not phoneme-level forced alignment; it is the lightest
+# offline mechanism that yields genuine acoustic word timings here.
+# ---------------------------------------------------------------------------
+WORD_ALIGNMENT_ENABLED = os.getenv("WORD_ALIGNMENT_ENABLED", "true").strip().lower() == "true"
+# ggml whisper model file, downloaded separately into backend/models/ (see
+# backend/models/README). Word alignment is skipped when it is absent.
+WORD_ALIGNMENT_MODEL_PATH = os.getenv(
+    "WORD_ALIGNMENT_MODEL_PATH", str(BASE_DIR / "models" / "ggml-base.bin")
+)
+# Recognition language hint for whisper ("hi" suits Hindi/Hinglish speech).
+WORD_ALIGNMENT_LANGUAGE = os.getenv("WORD_ALIGNMENT_LANGUAGE", "hi").strip() or "hi"
+# Inference threads for the single per-job whisper pass.
+WORD_ALIGNMENT_THREADS = int(os.getenv("WORD_ALIGNMENT_THREADS", "4"))
+# Per-cue quality gate: minimum fraction of a cue's words that must match a
+# recognised token before the cue's DTW anchors are trusted (used only by the
+# opt-in "dtw" interior method below).
+WORD_ALIGNMENT_MIN_MATCH = float(os.getenv("WORD_ALIGNMENT_MIN_MATCH", "0.6"))
+# Interior word-boundary method WITHIN each cue window. Cue start/end always
+# come from the (accurate) audio VAD and are never changed by this setting:
+#   "proportional" (DEFAULT, hackathon build) — split the cue across its words
+#       in proportion to each word's character length. Robust and deterministic;
+#       it does NOT trust the whisper DTW anchors, which ggml-base distorts when
+#       it mis-hears the Roman-Urdu prompt (interior words squeezed to 20-84ms).
+#   "dtw" (opt-in) — affine-fit the whisper DTW anchors into the cue, but fall
+#       back to the proportional split for any cue whose match coverage is below
+#       WORD_ALIGNMENT_MIN_MATCH or whose DTW fit squeezes a word under
+#       WORD_ALIGNMENT_MIN_TRUSTED_WORD seconds.
+WORD_ALIGNMENT_METHOD = (
+    os.getenv("WORD_ALIGNMENT_METHOD", "proportional").strip().lower()
+    or "proportional"
+)
+# A DTW-fitted word shorter than this (seconds) means the anchors are not
+# trustworthy for that cue — fall back to the proportional interior split.
+WORD_ALIGNMENT_MIN_TRUSTED_WORD = float(
+    os.getenv("WORD_ALIGNMENT_MIN_TRUSTED_WORD", "0.04")
+)
+# Cached per-job recognition result (whisper DTW tokens) inside the job dir.
+WORD_ALIGNMENT_CACHE_FILENAME = "word_alignment.json"
 
 # Legacy Alibaba Cloud access-key variables — kept for reference only;
 # NOT used by the Model Studio Qwen3-ASR integration.

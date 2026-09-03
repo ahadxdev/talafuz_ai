@@ -48,6 +48,20 @@ class TranscriptResponse(BaseModel):
 # Phase 3 — Romanized subtitle models
 # ---------------------------------------------------------------------------
 
+class WordTiming(BaseModel):
+    """One real audio-derived word timing inside a cue (seconds).
+
+    Produced by the offline whisper.cpp DTW aligner and persisted only for
+    cues that pass its quality gate. A cue without validated word timings
+    omits `words` entirely, signalling every consumer (editor highlight,
+    SRT, burn-in) to fall back to proportional estimation — estimated
+    timings are never stored or served as real ones.
+    """
+    word: str                    # exact whitespace token of romanized_text
+    start: float                 # seconds, >= subtitle.start
+    end: float                   # seconds, <= subtitle.end, > start
+
+
 class RomanizeRequest(BaseModel):
     # The English translation is generated alongside romanization by
     # default — the editor, SRT and video exports all use it. Romanized
@@ -62,6 +76,7 @@ class RomanizedSubtitle(BaseModel):
     original_text: str           # original ASR text, never overwritten
     romanized_text: str          # Latin-script (Roman Urdu/Hindi) version
     english_text: Optional[str] = None  # only present when requested
+    words: Optional[List[WordTiming]] = None  # real word timings when aligned
 
 
 class RomanizeResponse(BaseModel):
@@ -85,6 +100,10 @@ class EditedSubtitle(BaseModel):
     original_text: str           # original ASR text, never changed
     romanized_text: str          # user-editable romanized text
     english_text: Optional[str] = None  # user-editable English text
+    # Word timings carried over from generation. On save they are re-validated
+    # against the (possibly edited) romanized_text and cue window; stale or
+    # mismatched timings are dropped so a manual edit never keeps fake words.
+    words: Optional[List[WordTiming]] = None
 
 
 class SubtitleSaveRequest(BaseModel):

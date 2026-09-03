@@ -42,6 +42,7 @@ from ..config import (
     VIDEO_EXPORT_TIMEOUT,
 )
 from .audio_service import FFmpegNotFoundError, _format_output, is_ffmpeg_installed
+from .word_alignment_service import validate_word_timings
 
 logger = logging.getLogger(__name__)
 
@@ -211,16 +212,75 @@ def _speech_weight(word: str) -> float:
     return weight
 
 
-def _word_events(words: list, start: float, end: float, text_rgb: str, highlight_rgb: str) -> list:
+def _get_valid_word_timings(sub: Dict[str, Any], displayed_text: str) -> Optional[list]:
+    """Real per-word (start, end) seconds for the DISPLAYED text, or None.
+
+    Uses the persisted subtitle['words'] (whisper.cpp DTW timings) only when
+    they validate against the displayed tokens and the cue window — i.e. the
+    words on screen are exactly the romanized words the timings were aligned
+    to. Any mismatch (English/original display, a manual text edit, missing or
+    invalid timings) returns None so the caller falls back to the
+    proportional _word_timings() estimate. This is the SAME persisted data the
+    editor preview highlights from, so preview and burn-in agree.
+    """
+    words = sub.get("words")
+    if not words:
+        return None
+    try:
+        start = float(sub.get("start", 0) or 0)
+        end = float(sub.get("end", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    cleaned = validate_word_timings(words, displayed_text, start, end)
+    if not cleaned:
+        return None
+    return [(w["start"], w["end"]) for w in cleaned]
+
+
+def _boundaries_from_word_times(word_times: list, start: float, end: float) -> list:
+    """Centisecond event boundaries from real per-word (start, end) seconds.
+
+    Boundary k is the start of word k and the last boundary is the cue end.
+    Values are clamped into the cue and forced strictly increasing (mirroring
+    _word_timings' rounding guard) so ASS events never collapse or overlap.
+    """
+    n = len(word_times)
+    start_cs = round(float(start) * 100)
+    end_cs = max(round(float(end) * 100), start_cs + n)
+    boundaries = [start_cs]
+    for k in range(1, n):
+        cs = round(float(word_times[k][0]) * 100)
+        boundaries.append(min(max(cs, start_cs), end_cs))
+    boundaries.append(end_cs)
+    for k in range(1, n + 1):
+        if boundaries[k] <= boundaries[k - 1]:
+            boundaries[k] = boundaries[k - 1] + 1
+    boundaries[-1] = max(boundaries[-1], end_cs)
+    return boundaries
+
+
+def _word_events(
+    words: list,
+    start: float,
+    end: float,
+    text_rgb: str,
+    highlight_rgb: str,
+    word_times: Optional[list] = None,
+) -> list:
     """
     Build one Dialogue body per word: the active word is wrapped in an
     inline \\c override to the highlight colour and restored afterwards, so
     exactly one word is highlighted at a time (mirroring the preview).
 
-    Returns a list of (start_cs, end_cs, body) tuples with centisecond
-    boundaries from _word_timings.
+    Event boundaries come from the real per-word timings (`word_times`) when
+    they are valid and line up 1:1 with the displayed words; otherwise they
+    fall back to the proportional _word_timings() estimate. Returns a list of
+    (start_cs, end_cs, body) tuples with centisecond boundaries.
     """
-    boundaries = _word_timings(words, start, end)
+    if word_times is not None and len(word_times) == len(words):
+        boundaries = _boundaries_from_word_times(word_times, start, end)
+    else:
+        boundaries = _word_timings(words, start, end)
     events = []
     for k, word in enumerate(words):
         parts = []
@@ -401,21 +461,27 @@ def generate_ass_content(
             continue
         if end <= start:
             continue
-        text = _cue_text(sub, language)
-        if not text:
+        raw_text = _cue_text(sub, language)
+        if not raw_text:
             continue
-        if uppercase:
-            text = text.upper()
+        # Real word timings apply only when the words on screen are the
+        # romanized words they were aligned to (validated against raw_text,
+        # before any uppercase cosmetic transform, which preserves token
+        # count and order).
+        word_times = _get_valid_word_timings(sub, raw_text)
+        text = raw_text.upper() if uppercase else raw_text
         words = [_escape_ass_word(w) for w in text.split()]
         if not words:
             continue
+        if word_times is not None and len(word_times) != len(words):
+            word_times = None  # display token count differs — fall back
 
         if word_highlight and len(words) > 1:
             # One event per word: only the spoken word carries the highlight
             # colour at any moment (entrance animation on the first event,
             # fade-out on the last).
             for k, (cs0, cs1, body) in enumerate(
-                _word_events(words, start, end, text_rgb, highlight_rgb)
+                _word_events(words, start, end, text_rgb, highlight_rgb, word_times)
             ):
                 phase = "first" if k == 0 else "last" if k == len(words) - 1 else "mid"
                 override = _override_tags(ass_align, anchor_px, anchor_py, animation, phase)

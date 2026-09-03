@@ -1,7 +1,16 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import FRONTEND_URL, API_PREFIX
 from .api import router as videos_router
+
+# Surface application INFO logs (e.g. subtitle alignment diagnostics).
+# Secrets are never logged — error text from providers is sanitized.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:     %(name)s - %(message)s",
+)
 
 app = FastAPI(
     title="Talafuz AI",

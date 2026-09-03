@@ -20,10 +20,12 @@ import { secondsToMinutesSeconds } from "../../utils/timeUtils";
 /**
  * Phase 4 — Center panel video preview.
  *
- * Plays the job's uploaded video, renders the styled caption overlay aligned
- * to the displayed video rect (letterboxing-aware), and reports playback time
- * to the parent at ~15 fps so the caption list, timeline and word highlight
- * stay in sync without re-rendering at full frame rate.
+ * Plays the job's uploaded video and renders the styled caption overlay aligned
+ * to the displayed video rect (letterboxing-aware). Playback time reaches the
+ * parent two ways: a coarse ~15 fps report for the caption list / timeline /
+ * style panel, and an un-throttled live playhead (getPlayheadTime) the caption
+ * overlay reads every frame for smooth word highlighting — so the highlight
+ * tracks speech within a frame without re-rendering the editor at full rate.
  */
 
 const TIME_REPORT_INTERVAL = 1 / 15; // seconds between time updates
@@ -46,6 +48,8 @@ export const VideoStage = forwardRef(function VideoStage(
   const rafRef = useRef(0);
   const lastSentRef = useRef(0);
   const onCurrentTimeRef = useRef(onCurrentTime);
+  // Live playhead, refreshed EVERY frame (un-throttled) for the word highlight.
+  const playheadRef = useRef(0);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -60,15 +64,23 @@ export const VideoStage = forwardRef(function VideoStage(
     onCurrentTimeRef.current = onCurrentTime;
   }, [onCurrentTime]);
 
-  // Report playback time via rAF (throttled) while playing.
+  // Report playback time via rAF while playing. Two paths share one loop:
+  //  • playheadRef — refreshed EVERY frame (un-throttled) so the caption overlay
+  //    can read the live playhead directly (getPlayheadTime) instead of waiting
+  //    on the ~15 Hz React state round-trip.
+  //  • onCurrentTime — the coarse ~15 Hz update EditorPage's state still uses to
+  //    drive SubtitleList / Timeline / StylePanel (TIME_REPORT_INTERVAL unchanged).
   useEffect(() => {
     const tick = () => {
       const video = videoRef.current;
-      if (video && !video.paused && !video.ended) {
-        const t = video.currentTime;
-        if (Math.abs(t - lastSentRef.current) >= TIME_REPORT_INTERVAL) {
-          lastSentRef.current = t;
-          onCurrentTimeRef.current(t);
+      if (video) {
+        playheadRef.current = video.currentTime;
+        if (!video.paused && !video.ended) {
+          const t = video.currentTime;
+          if (Math.abs(t - lastSentRef.current) >= TIME_REPORT_INTERVAL) {
+            lastSentRef.current = t;
+            onCurrentTimeRef.current(t);
+          }
         }
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -114,6 +126,14 @@ export const VideoStage = forwardRef(function VideoStage(
       video.pause();
     }
   }, []);
+
+  // Stable imperative getter the caption overlay calls every frame to read the
+  // LIVE playhead directly — bypasses the throttled React state round-trip so
+  // the word highlight never triggers (or waits on) an EditorPage re-render.
+  const getPlayheadTime = useCallback(
+    () => (videoRef.current ? videoRef.current.currentTime : playheadRef.current),
+    []
+  );
 
   useImperativeHandle(ref, () => ({
     seek: seekTo,
@@ -229,7 +249,7 @@ export const VideoStage = forwardRef(function VideoStage(
             subtitle={activeSubtitle}
             language={language}
             style={style}
-            currentTime={currentTime}
+            getPlayheadTime={getPlayheadTime}
             showSafeZone={showSafeZone}
             highlightEnabled={highlightEnabled}
           />

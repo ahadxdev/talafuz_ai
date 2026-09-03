@@ -4,3 +4,7 @@ python-multipart==0.0.6
 python-dotenv==1.0.0
 pydantic==2.5.0
 requests==2.32.3
+# Word-level timing alignment (offline whisper.cpp DTW). Optional at runtime:
+# word alignment is skipped when this or the ggml model is missing, and cues
+# fall back to proportional timing.
+pywhispercpp==1.5.1

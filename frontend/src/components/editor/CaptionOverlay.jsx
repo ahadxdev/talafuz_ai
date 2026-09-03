@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { getActiveWordIndex, getSubtitleText } from "../../utils/subtitleUtils";
 
 /**
@@ -24,16 +25,47 @@ export function CaptionOverlay({
   subtitle,
   language,
   style,
-  currentTime,
+  getPlayheadTime,
   showSafeZone = false,
   highlightEnabled = true,
 }) {
   const text = getSubtitleText(subtitle, language) || "";
   const words = text.split(/\s+/).filter(Boolean);
-  const activeWordIndex =
-    style.wordHighlight && highlightEnabled && words.length > 0 && subtitle
-      ? getActiveWordIndex(words, subtitle, currentTime)
-      : -1;
+
+  // The highlighted word is driven by the LIVE playhead, read every animation
+  // frame via getPlayheadTime, instead of the throttled ~15 Hz currentTime prop.
+  // Only the resulting index is local state, and it is set solely when it changes,
+  // so smooth highlighting never re-renders (or waits on) the parent editor.
+  const highlightOn = style.wordHighlight && highlightEnabled;
+  const [activeWordIndex, setActiveWordIndex] = useState(-1);
+
+  const wordsRef = useRef(words);
+  wordsRef.current = words;
+  const subtitleRef = useRef(subtitle);
+  subtitleRef.current = subtitle;
+  const highlightOnRef = useRef(highlightOn);
+  highlightOnRef.current = highlightOn;
+  const lastIndexRef = useRef(-1);
+
+  useEffect(() => {
+    if (typeof getPlayheadTime !== "function") return undefined;
+    let raf = 0;
+    const loop = () => {
+      const w = wordsRef.current;
+      const sub = subtitleRef.current;
+      const idx =
+        highlightOnRef.current && w.length > 0 && sub
+          ? getActiveWordIndex(w, sub, getPlayheadTime())
+          : -1;
+      if (idx !== lastIndexRef.current) {
+        lastIndexRef.current = idx;
+        setActiveWordIndex(idx);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [getPlayheadTime]);
 
   const animClass =
     style.animation && style.animation !== "none"

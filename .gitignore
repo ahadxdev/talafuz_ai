@@ -51,3 +51,9 @@ Thumbs.db
 
 # Video data
 backend/data/jobs/
+
+# Local whisper.cpp ggml models for word-level timing alignment (~147 MB each;
+# downloaded separately into backend/models/, never committed). Ignore the
+# model binaries but keep the instructions for obtaining them.
+backend/models/*
+!backend/models/README.md

@@ -46,11 +46,89 @@ function splitTextAtRatio(text, ratio) {
   return [words.slice(0, cut).join(" "), words.slice(cut).join(" ")];
 }
 
+const tokensOf = (text) => (text || "").trim().split(/\s+/).filter(Boolean);
+
+/**
+ * Validate + clean a real word-timing array against the tokens actually
+ * displayed and the cue window. Returns a fresh [{ word, start, end }] array
+ * when every word matches its token and the timings sit inside [start, end],
+ * strictly increasing and non-overlapping; otherwise null, so the caller drops
+ * the timings and falls back to the proportional estimate. Mirrors the backend
+ * word_alignment_service.validate_word_timings gate — stale or mismatched
+ * timings are never kept, and estimates are never passed off as real.
+ */
+function sanitizeRealWords(realWords, tokens, start, end) {
+  if (!Array.isArray(realWords) || realWords.length !== tokens.length) return null;
+  const out = [];
+  let prevEnd = null;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const w = realWords[i];
+    if (!w || typeof w.start !== "number" || typeof w.end !== "number") return null;
+    if (w.word === undefined || String(w.word).trim() !== String(tokens[i]).trim()) return null;
+    if (!(w.end > w.start)) return null;
+    if (w.start < start - 1e-3 || w.end > end + 1e-3) return null;
+    if (prevEnd !== null && w.start < prevEnd - 1e-3) return null;
+    out.push({ word: tokens[i], start: w.start, end: w.end });
+    prevEnd = w.end;
+  }
+  return out;
+}
+
+/** A cue's validated real word timings, or null when absent/mismatched. */
+function realWordsOf(sub) {
+  if (!sub) return null;
+  return sanitizeRealWords(sub.words, tokensOf(sub.romanized_text), sub.start, sub.end);
+}
+
+/**
+ * Split a cue's real word timings at a word boundary (`cut` = number of words
+ * in the first half), clamping the boundary word to `time`. Returns
+ * [firstWords, secondWords] (either may be null) — a split never fabricates
+ * word timings, so an unsplittable/invalid half simply drops them.
+ */
+function splitRealWords(sub, cut, time) {
+  const real = realWordsOf(sub);
+  if (!real || cut <= 0 || cut >= real.length) return [null, null];
+  const first = real.slice(0, cut);
+  const second = real.slice(cut);
+  first[first.length - 1] = {
+    ...first[first.length - 1],
+    end: Math.min(first[first.length - 1].end, time),
+  };
+  second[0] = { ...second[0], start: Math.max(second[0].start, time) };
+  return [
+    sanitizeRealWords(first, first.map((w) => w.word), sub.start, time),
+    sanitizeRealWords(second, second.map((w) => w.word), time, sub.end),
+  ];
+}
+
+/**
+ * Concatenate two adjacent cues' real word timings for a merge. Returns the
+ * joined array only when BOTH cues carry valid timings that still line up with
+ * the merged text and window; otherwise undefined (the merged cue falls back).
+ */
+function joinRealWords(first, second, mergedText) {
+  const a = realWordsOf(first);
+  const b = realWordsOf(second);
+  if (!a || !b) return undefined;
+  const joined = [...a, ...b];
+  return (
+    sanitizeRealWords(
+      joined,
+      tokensOf(mergedText),
+      Math.min(first.start, second.start),
+      Math.max(first.end, second.end)
+    ) || undefined
+  );
+}
+
 /**
  * Split a subtitle at `time` seconds.
- * Texts are split at a proportional word position (cue timing is known,
- * word-level ASR timing is not). Returns [first, second] or null when the
- * playhead is not strictly inside the cue.
+ * Texts are split at a proportional word position. When the cue carries real
+ * (audio-derived) word timings they are split at the same boundary and clamped
+ * to `time`; otherwise the halves drop word timings and fall back to the
+ * estimate. Returns [first, second] or null when the playhead is not strictly
+ * inside the cue.
  */
 export function splitSubtitleAt(subtitle, time) {
   if (!subtitle) return null;
@@ -59,6 +137,7 @@ export function splitSubtitleAt(subtitle, time) {
   const [romA, romB] = splitTextAtRatio(subtitle.romanized_text, ratio);
   const [engA, engB] = splitTextAtRatio(subtitle.english_text, ratio);
   const [origA, origB] = splitTextAtRatio(subtitle.original_text, ratio);
+  const [wordsA, wordsB] = splitRealWords(subtitle, tokensOf(romA).length, time);
   return [
     {
       ...subtitle,
@@ -66,6 +145,7 @@ export function splitSubtitleAt(subtitle, time) {
       romanized_text: romA,
       english_text: engA || null,
       original_text: origA,
+      words: wordsA,
     },
     {
       ...subtitle,
@@ -73,6 +153,7 @@ export function splitSubtitleAt(subtitle, time) {
       romanized_text: romB,
       english_text: engB || null,
       original_text: origB,
+      words: wordsB,
     },
   ];
 }
@@ -84,13 +165,17 @@ export function mergeSubtitles(first, second) {
     const parts = [a, b].filter((v) => v && v.trim());
     return parts.length ? parts.join(" ") : "";
   };
+  const romanized = join(first.romanized_text, second.romanized_text);
   return {
     ...first,
     start: Math.min(first.start, second.start),
     end: Math.max(first.end, second.end),
-    romanized_text: join(first.romanized_text, second.romanized_text),
+    romanized_text: romanized,
     english_text: join(first.english_text, second.english_text) || null,
     original_text: join(first.original_text, second.original_text),
+    // Carry real word timings across the merge only when both cues have valid
+    // timings that still line up with the merged text; otherwise fall back.
+    words: joinRealWords(first, second, romanized),
   };
 }
 
@@ -192,37 +277,55 @@ export function shortenSubtitles(
       continue;
     }
 
-    // Timing: boundaries proportional to the cumulative estimated speaking
-    // time of each chunk's words, so cue splits and word highlighting stay
-    // in sync with each other.
+    // Timing: when the cue carries real (audio-derived) word timings that
+    // match its tokens, each chunk inherits its own slice and the chunk window
+    // comes from those real timings; otherwise boundaries are proportional to
+    // the cumulative estimated speaking time of each chunk's words, so cue
+    // splits and word highlighting stay in sync with each other.
     const romPieces = chunks.map((c) => c.join(" "));
     const engPieces = splitFieldIntoChunks(sub.english_text, chunks.length);
     const origPieces = splitFieldIntoChunks(sub.original_text, chunks.length);
     const weights = words.map(speechWeight);
     const totalWeight = weights.reduce((sum, w) => sum + w, 0);
     const round3 = (v) => Number(v.toFixed(3));
+    const real = realWordsOf(sub);
     let weightCursor = 0;
     let wordCursor = 0;
     let start = sub.start;
     for (let i = 0; i < chunks.length; i += 1) {
       const isLast = i === chunks.length - 1;
+      const rangeStart = wordCursor;
       for (let k = 0; k < chunks[i].length; k += 1) {
         weightCursor += weights[wordCursor];
         wordCursor += 1;
       }
-      const boundary = isLast
-        ? sub.end
-        : sub.start + (duration * weightCursor) / totalWeight;
+      const rangeEnd = wordCursor; // exclusive
+      let chunkStart;
+      let chunkEnd;
+      let chunkWords;
+      if (real) {
+        // Real timings: the chunk window is the span of its own words and the
+        // words carry over unchanged, so highlighting stays audio-accurate.
+        chunkStart = real[rangeStart].start;
+        chunkEnd = real[rangeEnd - 1].end;
+        chunkWords = real.slice(rangeStart, rangeEnd);
+      } else {
+        chunkStart = start;
+        chunkEnd = isLast
+          ? sub.end
+          : sub.start + (duration * weightCursor) / totalWeight;
+        chunkWords = undefined; // no real timings to remap
+      }
       out.push({
         ...sub,
-        start: round3(start),
-        end: round3(boundary),
+        start: round3(chunkStart),
+        end: round3(chunkEnd),
         romanized_text: romPieces[i],
         english_text: engPieces[i] || null,
         original_text: origPieces[i],
-        words: undefined, // word timestamps no longer line up after splitting
+        words: chunkWords,
       });
-      start = boundary;
+      start = chunkEnd;
     }
   }
   return resequenceSubtitles(out);
@@ -312,7 +415,20 @@ export function createSubtitleAfter(subtitle, duration) {
 export function getActiveWordIndex(words, subtitle, time) {
   if (!subtitle || !Array.isArray(words) || words.length === 0) return -1;
   const realWords = Array.isArray(subtitle.words) ? subtitle.words : null;
-  if (realWords && realWords.length === words.length) {
+  // Real timings are used only when they line up with the words on screen:
+  // same count and, when a timing carries its token, the same token. A manual
+  // text edit or an English/original display therefore mismatches and falls
+  // back to the estimate — stale timings are never highlighted as if real.
+  const aligned =
+    realWords &&
+    realWords.length === words.length &&
+    realWords.every(
+      (rw, i) =>
+        rw &&
+        (rw.word === undefined ||
+          String(rw.word).trim() === String(words[i]).trim())
+    );
+  if (aligned) {
     for (let i = 0; i < realWords.length; i += 1) {
       const wStart = realWords[i].start ?? subtitle.start;
       const wEnd = realWords[i].end ?? subtitle.end;

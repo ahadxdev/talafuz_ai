@@ -18,12 +18,15 @@ Implementation notes:
   never fabricated.
 - Long segments are split into short, creator-style cues (~3–5 words,
   capped by SUBTITLE_MAX_CHARS_PER_LINE * SUBTITLE_MAX_LINES characters) at
-  word/punctuation boundaries; timestamps are distributed across the cues
-  in proportion to each cue's estimated speaking time (word length +
-  punctuation pauses). The original-script text and the English
-  translation are split in alignment with those chunks, so each cue
-  carries only its own original and English line — never the whole
-  segment's text.
+  word/punctuation boundaries. Cue TIMING comes from the audio: the
+  alignment service (alignment_service.py) detects speech/silence inside
+  each ASR segment from the extracted audio.wav and places cues inside
+  real speech regions, so cues never span meaningful pauses. The
+  text-proportional distributor below (distribute_timestamps) remains as
+  the fallback when alignment is disabled or audio analysis fails. The
+  original-script text and the English translation are split in alignment
+  with those chunks, so each cue carries only its own original and English
+  line — never the whole segment's text.
 """
 import json
 import logging
@@ -36,6 +39,12 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from .. import config
+from .alignment_service import (
+    AlignmentError,
+    align_chunk_times,
+    normalize_subtitle_timing,
+)
+from .word_alignment_service import align_subtitle_words
 
 logger = logging.getLogger(__name__)
 
@@ -95,9 +104,14 @@ class Subtitle:
     original_text: str
     romanized_text: str
     english_text: Optional[str] = None
+    # Real audio-derived word timings: [{"word", "start", "end"}, ...] in cue
+    # order, or None. Attached by word_alignment_service only when a cue
+    # passes the quality gate; None keeps the proportional fallback and is
+    # never fabricated from estimates.
+    words: Optional[List[Dict]] = None
 
     def to_dict(self) -> Dict:
-        return {
+        data = {
             "id": self.id,
             "start": round(self.start, 3),
             "end": round(self.end, 3),
@@ -105,6 +119,11 @@ class Subtitle:
             "romanized_text": self.romanized_text,
             "english_text": self.english_text,
         }
+        # Persist word timings only when present; their absence tells every
+        # consumer (editor, SRT, burn-in) to use the proportional fallback.
+        if self.words:
+            data["words"] = self.words
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +277,12 @@ def distribute_timestamps(
     chunks: List[str], start: float, end: float, min_duration: float
 ) -> List[Tuple[float, float]]:
     """
-    Proportionally distribute [start, end] across chunks (by character
-    weight), enforcing a minimum cue duration where the total time allows.
-    Timestamps always stay within the original ASR segment timing.
+    FALLBACK timing: proportionally distribute [start, end] across chunks
+    (by character weight), enforcing a minimum cue duration where the total
+    time allows. Timestamps always stay within the original ASR segment
+    timing. The preferred timing source is the audio-based alignment
+    service (alignment_service.align_chunk_times); this distributor is
+    only used when alignment is disabled or the audio analysis fails.
     """
     n = len(chunks)
     if n == 0:
@@ -395,16 +417,22 @@ class QwenRomanizationService:
     # ------------------------------------------------------------------
 
     def romanize_segments(
-        self, segments: List[Dict], include_english: bool = False
+        self,
+        segments: List[Dict],
+        include_english: bool = False,
+        audio_path: Optional[Path] = None,
     ) -> List[Subtitle]:
         """
         Romanize ASR transcript segments and produce segmented subtitles.
 
         `segments` are transcript.json entries: {id, start, end, text}.
-        Returns Subtitle cues; the stored transcript itself is never
-        modified. When a long segment is split into several cues, each
-        cue's original and English lines are aligned to its romanized
-        chunk instead of repeating the whole segment.
+        `audio_path` (when given) points at the extracted audio.wav and
+        enables audio-based cue timing via the alignment service; without
+        it, cue timing falls back to proportional distribution. Returns
+        Subtitle cues; the stored transcript itself is never modified.
+        When a long segment is split into several cues, each cue's
+        original and English lines are aligned to its romanized chunk
+        instead of repeating the whole segment.
         """
         self._validate_segments(segments)
 
@@ -429,7 +457,7 @@ class QwenRomanizationService:
             )
             english = {i: v for i, v in enumerate(english_list)}
 
-        return self._build_subtitles(segments, romanized, english)
+        return self._build_subtitles(segments, romanized, english, audio_path)
 
     # ------------------------------------------------------------------
     # Validation / assembly
@@ -471,10 +499,12 @@ class QwenRomanizationService:
         segments: List[Dict],
         romanized: List[str],
         english: Dict[int, str],
+        audio_path: Optional[Path] = None,
     ) -> List[Subtitle]:
         max_chars = config.SUBTITLE_MAX_CHARS_PER_LINE * config.SUBTITLE_MAX_LINES
         max_words = config.SUBTITLE_MAX_WORDS_PER_CUE
         subtitles: List[Subtitle] = []
+        vad_used = 0
         for i, seg in enumerate(segments):
             rom_text = (romanized[i] or "").strip()
             if not rom_text:
@@ -482,15 +512,44 @@ class QwenRomanizationService:
                     f"The model returned empty romanized text for segment {i}."
                 )
             chunks = split_text_into_chunks(rom_text, max_chars, max_words=max_words)
-            times = distribute_timestamps(
-                chunks, float(seg["start"]), float(seg["end"]),
-                config.SUBTITLE_MIN_DURATION,
+            weights = [speech_weight(chunk) for chunk in chunks]
+            seg_start, seg_end = float(seg["start"]), float(seg["end"])
+
+            # Timing: audio alignment first (never the LLM); proportional
+            # distribution only as fallback.
+            times = None
+            region_count = 0
+            mode = "fallback"
+            if audio_path is not None:
+                try:
+                    result = align_chunk_times(
+                        weights, audio_path, seg_start, seg_end
+                    )
+                    if result is not None:
+                        times = result.times
+                        region_count = len(result.speech_regions)
+                        mode = result.mode
+                except (AlignmentError, OSError, ValueError) as e:
+                    logger.warning(
+                        "Segment %d: audio alignment failed (%s) — falling "
+                        "back to proportional timing.", i, e,
+                    )
+            if times is None:
+                times = distribute_timestamps(
+                    chunks, seg_start, seg_end, config.SUBTITLE_MIN_DURATION,
+                )
+            else:
+                vad_used += 1
+            logger.info(
+                "ASR segment: %.3f → %.3f | subtitle chunks: %d | speech "
+                "regions: %d | alignment mode: %s",
+                seg_start, seg_end, len(chunks), region_count, mode,
             )
+
             # Align the original-script and English texts with the romanized
             # chunks so each cue carries only its own lines — a long segment
             # (e.g. a whole-video ASR segment) must not repeat its full text
             # under every cue.
-            weights = [speech_weight(chunk) for chunk in chunks]
             original_parts = split_text_by_word_counts(
                 seg["text"], [len(chunk.split()) for chunk in chunks]
             )
@@ -515,6 +574,29 @@ class QwenRomanizationService:
                 ))
         if not subtitles:
             raise RomanizationResponseError("No subtitles were produced.")
+        # Final pass: chronological, non-negative, non-overlapping cues
+        # (absorbs slightly overlapping ASR sentence boundaries), then
+        # renumber ids.
+        normalize_subtitle_timing(subtitles)
+        for idx, sub in enumerate(subtitles):
+            sub.id = idx + 1
+        if audio_path is not None:
+            logger.info(
+                "Subtitle timing: %d/%d ASR segments aligned via audio VAD.",
+                vad_used, len(segments),
+            )
+            # Word-level timing: recognised ONCE per job (cached in the job
+            # directory) AFTER cue timing is final, then fitted into each cue
+            # window. Cues that miss the quality gate keep words=None and the
+            # existing proportional fallback. Best-effort — any failure leaves
+            # the cues untouched so romanization still succeeds.
+            try:
+                align_subtitle_words(subtitles, audio_path)
+            except Exception as e:  # noqa: BLE001 — word timing is optional
+                logger.warning(
+                    "Word alignment failed (%s) — cues keep proportional "
+                    "word timing.", e,
+                )
         return subtitles
 
     # ------------------------------------------------------------------

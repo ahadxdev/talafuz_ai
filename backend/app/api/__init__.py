@@ -23,13 +23,14 @@ from ..services.romanization_service import (
     save_romanized_subtitles,
 )
 from ..services.srt_service import generate_srt
-from ..services.audio_service import is_ffmpeg_installed
+from ..services.audio_service import get_audio_path, is_ffmpeg_installed
 from ..services.video_export_service import (
     VideoExportError,
     get_export_state,
     get_exported_video_path,
     start_export,
 )
+from ..services.word_alignment_service import validate_word_timings
 from ..config import JOBS_DIR, EXPORTED_VIDEO_FILENAME
 from ..models import (
     VideoUploadResponse,
@@ -316,7 +317,15 @@ async def get_transcript(job_id: str):
 def _run_romanization(job_id: str, segments, include_english: bool) -> dict:
     """Blocking romanization work — always runs in a worker thread."""
     service = QwenRomanizationService()
-    subtitles = service.romanize_segments(segments, include_english=include_english)
+    # Reuse the audio extracted in Phase 2 for audio-based subtitle timing
+    # (alignment service); never extract again. Missing audio simply falls
+    # back to proportional cue timing.
+    audio_path = get_audio_path(JOBS_DIR / job_id)
+    subtitles = service.romanize_segments(
+        segments,
+        include_english=include_english,
+        audio_path=audio_path if audio_path.exists() else None,
+    )
     save_romanized_subtitles(
         JOBS_DIR / job_id, job_id, subtitles,
         model=service._model,
@@ -384,6 +393,33 @@ def _load_edited_subtitles(job_dir: Path) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("subtitles"), list):
         return None
+    return data
+
+
+def _edited_subtitle_dict(sub: EditedSubtitle) -> Dict[str, Any]:
+    """Serialize one edited subtitle for subtitles.json.
+
+    Word timings are kept ONLY when they still validate against the
+    (possibly edited) romanized_text and cue window. A manual edit that
+    changes the text or timing therefore drops the stale word timings, so
+    consumers fall back to proportional estimation instead of trusting words
+    that no longer match what is displayed.
+    """
+    data: Dict[str, Any] = {
+        "id": sub.id,
+        "start": round(sub.start, 3),
+        "end": round(sub.end, 3),
+        "original_text": sub.original_text,
+        "romanized_text": sub.romanized_text,
+        "english_text": sub.english_text,
+    }
+    if sub.words:
+        validated = validate_word_timings(
+            [w.model_dump() for w in sub.words],
+            sub.romanized_text, sub.start, sub.end,
+        )
+        if validated:
+            data["words"] = validated
     return data
 
 
@@ -485,17 +521,7 @@ async def save_edited_subtitles(job_id: str, request: SubtitleSaveRequest):
         "job_id": job_id,
         "language": request.language,
         "style": request.style,
-        "subtitles": [
-            {
-                "id": sub.id,
-                "start": round(sub.start, 3),
-                "end": round(sub.end, 3),
-                "original_text": sub.original_text,
-                "romanized_text": sub.romanized_text,
-                "english_text": sub.english_text,
-            }
-            for sub in request.subtitles
-        ],
+        "subtitles": [_edited_subtitle_dict(sub) for sub in request.subtitles],
     }
 
     with open(subtitles_path, "w", encoding="utf-8") as f:
