@@ -134,7 +134,14 @@ export const api = {
    */
   async saveSubtitles(jobId, subtitles, options = {}) {
     const payload = { subtitles };
-    if (options.language) payload.language = options.language;
+    // "urdu" is a client-side, display-only script view derived from
+    // original_text; the backend persists romanized/english/original only, so
+    // it is never sent as the saved language (video/SRT export keep their own
+    // modes and are unaffected). The editor still restores Urdu from its
+    // localStorage draft within the session.
+    if (options.language && options.language !== "urdu") {
+      payload.language = options.language;
+    }
     if (options.style) payload.style = options.style;
 
     const response = await fetch(

@@ -411,6 +411,7 @@ def test_dtw_mode_uses_anchors_when_confident(monkeypatch):
     # drive the interior boundary — word "a" spans 0→2 (proportional would give
     # 0→1.333), proving the DTW path is actually exercised.
     monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "dtw")
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", True)
     matched = [(0.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
     out = _fit_cue_words(["a", "b", "c"], matched, 0.0, 4.0, 0.6)
     _assert_valid_words(out, "a b c", 0.0, 4.0)
@@ -422,6 +423,7 @@ def test_dtw_mode_falls_back_when_a_word_is_squeezed(monkeypatch):
     # Opt-in DTW: a misheard fit that squeezes a word under the 40 ms trust
     # floor falls back to the proportional split for that cue (even thirds).
     monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "dtw")
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", True)
     monkeypatch.setattr(config, "WORD_ALIGNMENT_MIN_TRUSTED_WORD", 0.04)
     matched = [(0.0, 0.01), (0.01, 0.02), (0.02, 1.0)]
     out = _fit_cue_words(["aaa", "bbb", "ccc"], matched, 0.0, 1.0, 0.6)
@@ -433,6 +435,7 @@ def test_dtw_mode_falls_back_below_coverage_gate(monkeypatch):
     # Opt-in DTW: coverage below the gate no longer yields None — it falls back
     # to the proportional split so the cue still gets sane interior timings.
     monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "dtw")
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", True)
     matched = [(0.0, 0.5), None, None, None]  # 1/4 = 0.25 < 0.6
     out = _fit_cue_words(["a", "b", "c", "d"], matched, 0.0, 4.0, 0.6)
     assert [w["word"] for w in out] == ["a", "b", "c", "d"]
@@ -474,7 +477,11 @@ def test_align_empty_subtitles(monkeypatch):
 
 
 def test_align_no_tokens_attaches_nothing(monkeypatch):
+    # DTW path: no recognised tokens → nothing is attached. (The default audio
+    # path does not depend on whisper, so this token gate is DTW-specific.)
     monkeypatch.setattr(config, "WORD_ALIGNMENT_ENABLED", True)
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "dtw")
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", True)
     _patch_tokens(monkeypatch, [])
     subs = [_sub(0.0, 2.0, "Agar main")]
     assert align_subtitle_words(subs, "audio.wav") == 0
@@ -947,6 +954,8 @@ def test_align_subtitle_words_writes_cache_into_the_current_job(tmp_path, monkey
     # End-to-end through the public API: aligning cues for a random job runs
     # against THAT job's audio and persists THAT job's OWN word_alignment.json.
     monkeypatch.setattr(config, "WORD_ALIGNMENT_ENABLED", True)
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "dtw")
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", True)
     fake = _FakeWhisper()
     monkeypatch.setattr(was, "_load_model", lambda: fake)
     monkeypatch.setattr(
@@ -964,3 +973,201 @@ def test_align_subtitle_words_writes_cache_into_the_current_job(tmp_path, monkey
     assert fake.calls == [str(audio.resolve())]   # ran against THIS job's audio
     assert was._cache_path(job).exists()          # wrote THIS job's cache
     assert subs[0].words == [{"word": "hello", "start": 0.0, "end": 1.0}]
+
+
+# ---------------------------------------------------------------------------
+# 13. Audio-driven INTERIOR word boundaries (the default "audio" method)
+#
+# These cover the ten required cases: enough boundaries (A), fewer than words
+# (B, hybrid), none (C, proportional), too many candidates, a candidate that
+# would create a <40 ms word, continuous speech, exact cue-endpoint
+# preservation, monotonicity, fallback when disabled, and mixed acoustic +
+# proportional anchors. The DSP is exercised end-to-end on a synthesised wav.
+# ---------------------------------------------------------------------------
+
+def _write_synth_wav(path, bursts, dur, sr=16000, amp=0.3, freq=200.0):
+    """Write a 16-bit mono wav: sine bursts (voiced) separated by silence."""
+    import array
+    import math
+    import wave
+    n = int(sr * dur)
+    smp = array.array("h")
+    for i in range(n):
+        t = i / sr
+        v = 0.0
+        for (a, b) in bursts:
+            if a <= t < b:
+                v = amp * math.sin(2 * math.pi * freq * t)
+                break
+        smp.append(int(v * 32767))
+    wf = wave.open(str(path), "wb")
+    wf.setnchannels(1)
+    wf.setsampwidth(2)
+    wf.setframerate(sr)
+    wf.writeframes(smp.tobytes())
+    wf.close()
+    return path
+
+
+@pytest.fixture
+def _audio_method(monkeypatch):
+    """Force the default audio interior method with deterministic tuning."""
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "audio")
+    monkeypatch.setattr(config, "SUBTITLE_AUDIO_BOUNDARY_ALIGNMENT_ENABLED", True)
+    monkeypatch.setattr(config, "SUBTITLE_DTW_ALIGNMENT_ENABLED", False)
+    monkeypatch.setattr(config, "AUDIO_BOUNDARY_SMOOTH_MS", 30.0)
+    monkeypatch.setattr(config, "AUDIO_BOUNDARY_MIN_GAP_MS", 40.0)
+    monkeypatch.setattr(config, "AUDIO_BOUNDARY_GAP_DEPTH_DB", 12.0)
+    monkeypatch.setattr(config, "AUDIO_BOUNDARY_MIN_WORD_MS", 40.0)
+    monkeypatch.setattr(config, "AUDIO_BOUNDARY_EDGE_MARGIN_MS", 40.0)
+
+
+def test_audio_envelope_and_candidates_detect_gaps(_audio_method, tmp_path):
+    # Three voiced bursts separated by 100 ms silences → two interior
+    # candidates at the ONSETS of the 2nd and 3rd bursts (0.5 s and 0.9 s).
+    wav = _write_synth_wav(
+        tmp_path / "a.wav", [(0.1, 0.4), (0.5, 0.8), (0.9, 1.2)], 1.3
+    )
+    ctx = was._load_audio_context(wav)
+    assert ctx is not None
+    cands = was._cue_candidates(ctx, 0.0, 1.3)
+    assert [round(t, 2) for (t, _d) in cands] == [0.5, 0.9]
+    assert all(d >= 12.0 for (_t, d) in cands)
+
+
+def test_audio_case_a_enough_boundaries_all_acoustic(_audio_method):
+    # 4 words, 3 candidates on the proportional junctions → CASE A: every
+    # junction anchored, so each interior word starts exactly at its candidate.
+    cands = [(0.30, 25.0), (0.60, 25.0), (0.90, 25.0)]
+    words, src = was._audio_word_split(["a", "b", "c", "d"], 0.0, 1.2, cands)
+    assert src == ["ACOUSTIC", "ACOUSTIC", "ACOUSTIC"]
+    assert [w["start"] for w in words] == [0.0, 0.30, 0.60, 0.90]
+    assert words[-1]["end"] == pytest.approx(1.2)
+    _assert_valid_words(words, "a b c d", 0.0, 1.2)
+
+
+def test_audio_case_b_fewer_boundaries_hybrid(_audio_method):
+    # 5 words (4 junctions) but only 2 candidates → hybrid (CASE B): the two
+    # acoustic gaps anchor their nearest junctions, the other two stay
+    # proportional. Proves we do NOT force a gap onto every junction.
+    cands = [(0.48, 25.0), (0.96, 25.0)]
+    words, src = was._audio_word_split(["a", "b", "c", "d", "e"], 0.0, 1.2, cands)
+    assert src.count("ACOUSTIC") == 2 and src.count("PROPORTIONAL") == 2
+    assert words[2]["start"] == pytest.approx(0.48, abs=1e-3)
+    assert words[4]["start"] == pytest.approx(0.96, abs=1e-3)
+    _assert_valid_words(words, "a b c d e", 0.0, 1.2)
+
+
+def test_audio_case_c_no_boundaries_is_proportional(_audio_method):
+    # No candidates at all → the existing proportional character split, and
+    # every junction is labelled PROPORTIONAL.
+    words, src = was._audio_word_split(["aa", "bb", "cc"], 0.0, 0.9, [])
+    prop = _proportional_word_split(["aa", "bb", "cc"], 0.0, 0.9)
+    assert words == prop
+    assert src == ["PROPORTIONAL", "PROPORTIONAL"]
+
+
+def test_audio_continuous_speech_has_no_gaps(_audio_method, tmp_path):
+    # One continuous voiced burst (no interior silence) → no candidates, so the
+    # split falls back to proportional instead of inventing fake boundaries.
+    wav = _write_synth_wav(tmp_path / "c.wav", [(0.05, 1.15)], 1.2)
+    ctx = was._load_audio_context(wav)
+    cands = was._cue_candidates(ctx, 0.0, 1.2)
+    assert cands == []
+    words, src = was._audio_word_split(
+        ["how", "are", "you", "doing"], 0.0, 1.2, cands
+    )
+    assert set(src) == {"PROPORTIONAL"}
+    _assert_valid_words(words, "how are you doing", 0.0, 1.2)
+
+
+def test_audio_too_many_candidates_selects_best(_audio_method):
+    # 2 words (1 junction) but 3 candidates → select the single best (deepest,
+    # closest to the proportional prior), not the first one.
+    cands = [(0.30, 10.0), (0.50, 30.0), (0.70, 10.0)]
+    words, src = was._audio_word_split(["ab", "cd"], 0.0, 1.0, cands)
+    assert src == ["ACOUSTIC"]
+    assert words[1]["start"] == pytest.approx(0.50)
+
+
+def test_audio_avoids_candidate_that_creates_short_word(_audio_method):
+    # Two candidates 20 ms apart: anchoring both would create a 20 ms word, so
+    # the DP leaves one junction proportional — no sub-40 ms flash.
+    cands = [(0.50, 25.0), (0.52, 25.0)]
+    words, src = was._audio_word_split(["aa", "bb", "cc"], 0.0, 1.0, cands)
+    assert all((w["end"] - w["start"]) >= 0.04 for w in words)
+    assert "PROPORTIONAL" in src
+    _assert_valid_words(words, "aa bb cc", 0.0, 1.0)
+
+
+def test_audio_preserves_cue_endpoints(_audio_method):
+    cands = [(0.55, 30.0)]
+    words, _src = was._audio_word_split(["aa", "bb"], 2.0, 4.0, cands)
+    assert words[0]["start"] == pytest.approx(2.0)
+    assert words[-1]["end"] == pytest.approx(4.0)
+
+
+def test_audio_monotonic_contiguous(_audio_method):
+    cands = [(0.30, 20.0), (0.62, 20.0), (0.95, 20.0)]
+    words, _src = was._audio_word_split(["a", "b", "c", "d"], 0.0, 1.2, cands)
+    for i in range(1, len(words)):
+        assert words[i]["start"] == pytest.approx(words[i - 1]["end"])
+        assert words[i]["end"] > words[i]["start"]
+    assert validate_word_timings(words, "a b c d", 0.0, 1.2) is not None
+
+
+def test_audio_fallback_when_disabled(monkeypatch):
+    # SUBTITLE_AUDIO_BOUNDARY_ALIGNMENT_ENABLED=false degrades "audio" to the
+    # proportional split even when candidates are supplied.
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_METHOD", "audio")
+    monkeypatch.setattr(config, "SUBTITLE_AUDIO_BOUNDARY_ALIGNMENT_ENABLED", False)
+    out = _fit_cue_words(
+        ["a", "b"], [None, None], 0.0, 2.0, 0.6, candidates=[(0.9, 30.0)]
+    )
+    assert out == [
+        {"word": "a", "start": 0.0, "end": 1.0},
+        {"word": "b", "start": 1.0, "end": 2.0},
+    ]
+
+
+def test_audio_fit_uses_candidates(_audio_method):
+    # Through the public per-cue fitter with ONE candidate for a 3-word cue: it
+    # anchors the nearest junction (word "c" starts at the acoustic 0.70) while
+    # the other junction stays proportional (word "b" at 0.40) — the hybrid.
+    out = _fit_cue_words(
+        ["a", "b", "c"], [None] * 3, 0.0, 1.2, 0.6, candidates=[(0.70, 30.0)]
+    )
+    assert out[0]["start"] == pytest.approx(0.0)
+    assert out[1]["start"] == pytest.approx(0.40)   # proportional junction
+    assert out[2]["start"] == pytest.approx(0.70)   # acoustic junction
+    assert out[-1]["end"] == pytest.approx(1.2)
+
+
+def test_align_audio_does_not_run_whisper(_audio_method, tmp_path, monkeypatch):
+    # The default audio path must be whisper-free: recognition is never called,
+    # yet real acoustic word timings are attached from the wav.
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_ENABLED", True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("whisper must not run for the audio method")
+
+    monkeypatch.setattr(was, "recognize_word_tokens", _boom)
+    wav = _write_synth_wav(
+        tmp_path / "a.wav", [(0.1, 0.4), (0.5, 0.8), (0.9, 1.2)], 1.3
+    )
+    subs = [_sub(0.0, 1.3, "ek do teen")]
+    assert align_subtitle_words(subs, wav) == 1
+    assert subs[0].words[1]["start"] == pytest.approx(0.5, abs=0.02)
+    assert subs[0].words[2]["start"] == pytest.approx(0.9, abs=0.02)
+
+
+def test_align_audio_attaches_words_from_real_wav(_audio_method, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "WORD_ALIGNMENT_ENABLED", True)
+    wav = _write_synth_wav(
+        tmp_path / "a.wav", [(0.1, 0.4), (0.5, 0.8), (0.9, 1.2)], 1.3
+    )
+    subs = [_sub(0.0, 1.3, "ek do teen")]
+    assert align_subtitle_words(subs, wav) == 1
+    _assert_valid_words(subs[0].words, "ek do teen", 0.0, 1.3)
+    assert subs[0].words[0]["start"] == pytest.approx(0.0)
+    assert subs[0].words[-1]["end"] == pytest.approx(1.3)

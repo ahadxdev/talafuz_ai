@@ -65,7 +65,7 @@ export function SubtitleList({
   }, [activeSubtitleId]);
 
   const startEdit = (sub) => {
-    if (language === "original") return; // original ASR text is read-only
+    if (language === "original" || language === "urdu") return; // read-only views (original ASR / Urdu script)
     const text = getSubtitleText(sub, language);
     setEditingId(sub.id);
     setDraft(text);
@@ -254,7 +254,7 @@ export function SubtitleList({
                     {secondsToTimestamp(sub.start)} →{" "}
                     {secondsToTimestamp(sub.end)}
                   </span>
-                  {language !== "original" && !isEditing && (
+                  {language !== "original" && language !== "urdu" && !isEditing && (
                     <button
                       type="button"
                       onClick={(e) => {

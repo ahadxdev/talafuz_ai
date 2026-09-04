@@ -4,13 +4,20 @@
  * Subtitles use the backend snake_case shape produced by the romanization
  * pipeline: { id, start, end, original_text, romanized_text, english_text }.
  * The original ASR text is treated as read-only — no editor operation
- * modifies the stored transcript.
+ * modifies the stored transcript. The "urdu" display language is a script
+ * conversion of original_text done on the fly (see urduTransliterate) and is
+ * likewise read-only — it never adds fields or alters subtitle timing.
  */
 
+import { devanagariToUrdu } from "./urduTransliterate.js";
+
+// Display order for the editor language switch: Original | Urdu | Romanized |
+// English. "urdu" is derived from original_text at render time only.
 export const LANGUAGES = [
+  { value: "original", label: "Original" },
+  { value: "urdu", label: "Urdu" },
   { value: "romanized", label: "Romanized" },
   { value: "english", label: "English" },
-  { value: "original", label: "Original" },
 ];
 
 /** Text shown for a subtitle in the requested display language. */
@@ -18,6 +25,12 @@ export function getSubtitleText(subtitle, language) {
   if (!subtitle) return "";
   if (language === "english") return subtitle.english_text || "";
   if (language === "original") return subtitle.original_text || "";
+  if (language === "urdu") {
+    // Urdu is a script conversion of the read-only original ASR text; fall
+    // back to the original Devanagari if the conversion yields nothing.
+    const src = subtitle.original_text || "";
+    return devanagariToUrdu(src) || src;
+  }
   return subtitle.romanized_text || "";
 }
 

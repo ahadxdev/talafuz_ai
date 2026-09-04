@@ -183,22 +183,65 @@ WORD_ALIGNMENT_THREADS = int(os.getenv("WORD_ALIGNMENT_THREADS", "4"))
 WORD_ALIGNMENT_MIN_MATCH = float(os.getenv("WORD_ALIGNMENT_MIN_MATCH", "0.6"))
 # Interior word-boundary method WITHIN each cue window. Cue start/end always
 # come from the (accurate) audio VAD and are never changed by this setting:
-#   "proportional" (DEFAULT, hackathon build) — split the cue across its words
-#       in proportion to each word's character length. Robust and deterministic;
-#       it does NOT trust the whisper DTW anchors, which ggml-base distorts when
-#       it mis-hears the Roman-Urdu prompt (interior words squeezed to 20-84ms).
-#   "dtw" (opt-in) — affine-fit the whisper DTW anchors into the cue, but fall
-#       back to the proportional split for any cue whose match coverage is below
-#       WORD_ALIGNMENT_MIN_MATCH or whose DTW fit squeezes a word under
-#       WORD_ALIGNMENT_MIN_TRUSTED_WORD seconds.
+#   "audio" (DEFAULT, hackathon build) — detect acoustic interior boundaries
+#       from the extracted audio.wav energy envelope (low-energy gaps between
+#       voiced runs) and anchor word boundaries to them, falling back to the
+#       proportional character split for junctions with no reliable gap
+#       (continuous speech). Lightweight: pure-stdlib DSP, no whisper/torch.
+#   "proportional" — split the cue across its words in proportion to each word's
+#       character length (the previous default; still the per-cue fallback).
+#   "dtw" (opt-in) — affine-fit the whisper DTW anchors into the cue, gated per
+#       cue; only active when SUBTITLE_DTW_ALIGNMENT_ENABLED is true.
 WORD_ALIGNMENT_METHOD = (
-    os.getenv("WORD_ALIGNMENT_METHOD", "proportional").strip().lower()
-    or "proportional"
+    os.getenv("WORD_ALIGNMENT_METHOD", "audio").strip().lower() or "audio"
 )
 # A DTW-fitted word shorter than this (seconds) means the anchors are not
 # trustworthy for that cue — fall back to the proportional interior split.
 WORD_ALIGNMENT_MIN_TRUSTED_WORD = float(
     os.getenv("WORD_ALIGNMENT_MIN_TRUSTED_WORD", "0.04")
+)
+
+# ---------------------------------------------------------------------------
+# Audio-driven INTERIOR word-boundary alignment (the default method above)
+#
+# Cue start/end come from the (accurate) audio VAD and are NEVER changed here;
+# this only refines the INTERIOR boundaries between the words of a cue. It
+# reads the already-extracted audio.wav, builds a short-time energy envelope
+# (10 ms RMS→dB, lightly smoothed), finds low-energy gaps between voiced runs
+# inside each cue, and anchors word boundaries to those gaps — falling back to
+# the proportional character split for any junction with no reliable gap
+# (continuous speech). No whisper, no torch, no extra dependency (pure stdlib
+# DSP via `wave`).
+# ---------------------------------------------------------------------------
+# Master switch for the audio-driven interior alignment (WORD_ALIGNMENT_METHOD
+# "audio"). When false, "audio" degrades to the proportional split.
+SUBTITLE_AUDIO_BOUNDARY_ALIGNMENT_ENABLED = (
+    os.getenv("SUBTITLE_AUDIO_BOUNDARY_ALIGNMENT_ENABLED", "true").strip().lower()
+    == "true"
+)
+# Master switch for the legacy whisper-DTW interior alignment. OFF by default;
+# WORD_ALIGNMENT_METHOD "dtw" only takes effect when this is true.
+SUBTITLE_DTW_ALIGNMENT_ENABLED = (
+    os.getenv("SUBTITLE_DTW_ALIGNMENT_ENABLED", "false").strip().lower() == "true"
+)
+# Envelope smoothing window (ms): energy is framed at 10 ms; this many ms of
+# frames are averaged to suppress single-frame noise before gap detection.
+AUDIO_BOUNDARY_SMOOTH_MS = float(os.getenv("AUDIO_BOUNDARY_SMOOTH_MS", "30"))
+# A low-energy region must last at least this long (ms) to be a candidate gap.
+AUDIO_BOUNDARY_MIN_GAP_MS = float(os.getenv("AUDIO_BOUNDARY_MIN_GAP_MS", "40"))
+# A candidate gap must sit this many dB below the neighbouring voiced runs to
+# count as a real word separation (guards against noise-level dips). RELATIVE
+# threshold — the absolute speech floor is derived adaptively from the audio's
+# own energy distribution (p20/p90), so nothing is hardcoded to a fixed dBFS.
+AUDIO_BOUNDARY_GAP_DEPTH_DB = float(os.getenv("AUDIO_BOUNDARY_GAP_DEPTH_DB", "12"))
+# Practical minimum word duration (ms): a boundary that would create a word
+# shorter than this is strongly penalised (MIN_WORD_DURATION=0.02 s stays the
+# hard floor, so a genuinely short spoken word is never rejected outright).
+AUDIO_BOUNDARY_MIN_WORD_MS = float(os.getenv("AUDIO_BOUNDARY_MIN_WORD_MS", "40"))
+# A candidate boundary must be at least this far (ms) from the cue start/end so
+# the first/last word is never clipped to a sliver by a gap at the cue edge.
+AUDIO_BOUNDARY_EDGE_MARGIN_MS = float(
+    os.getenv("AUDIO_BOUNDARY_EDGE_MARGIN_MS", "40")
 )
 # Cached per-job recognition result (whisper DTW tokens) inside the job dir.
 WORD_ALIGNMENT_CACHE_FILENAME = "word_alignment.json"

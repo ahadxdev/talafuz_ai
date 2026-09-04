@@ -140,7 +140,9 @@ export function StylePanel({
     setTextDraft(getSubtitleText(selectedSubtitle, language));
   }, [selectedId, language]);
 
-  const isOriginal = language === "original";
+  // Original and Urdu are read-only display views (Urdu is derived from the
+  // original ASR text on the fly), so neither offers inline text editing.
+  const isOriginal = language === "original" || language === "urdu";
 
   return (
     <aside
@@ -182,7 +184,9 @@ export function StylePanel({
                     className="w-full bg-gray-950/50 border border-gray-800 rounded-md px-2 py-1.5 text-xs text-gray-400 resize-none cursor-default"
                   />
                   <p className="text-[10px] text-gray-600">
-                    Original ASR text is read-only.
+                    {language === "urdu"
+                      ? "Urdu is a read-only script view of the original ASR text."
+                      : "Original ASR text is read-only."}
                   </p>
                 </>
               ) : (
