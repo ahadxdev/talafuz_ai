@@ -225,16 +225,9 @@ class AlibabaCloudASRProvider(ASRProvider):
     @staticmethod
     def _raise_for_status(resp: requests.Response, action: str) -> None:
         """Convert non-200 responses into ASRAPIError (secrets redacted)."""
-        if resp.status_code in (401, 403):
-            raise ASRAPIError(
-                f"Alibaba Cloud rejected the API key while {action} "
-                f"(HTTP {resp.status_code}). Check that DASHSCOPE_API_KEY is "
-                "valid and matches the configured region "
-                "(API keys are region-specific)."
-            )
         raise ASRAPIError(
-            f"Alibaba Cloud API error while {action} (HTTP "
-            f"{resp.status_code}): {_sanitize_api_text(resp.text)}"
+            f"Alibaba Cloud API error while {action} "
+            f"(HTTP {resp.status_code}): {_sanitize_api_text(resp.text)}"
         )
 
     @staticmethod
