@@ -13,7 +13,8 @@ JOBS_DIR = DATA_DIR / "jobs"
 # Load environment variables from the project root .env (preferred), while
 # keeping a backward-compatible fallback for backend-local .env files.
 for env_path in (ROOT_DIR / ".env", BASE_DIR / ".env"):
-	load_dotenv(env_path)
+	# Load environment variables from the project root .env.
+    load_dotenv(ROOT_DIR / ".env", override=True)
 
 # Ensure directories exist
 DATA_DIR.mkdir(exist_ok=True)

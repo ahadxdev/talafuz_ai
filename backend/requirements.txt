@@ -8,3 +8,4 @@ requests==2.32.3
 # word alignment is skipped when this or the ggml model is missing, and cues
 # fall back to proportional timing.
 pywhispercpp==1.5.1
+dashscope==1.27.7

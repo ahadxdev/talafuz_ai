@@ -692,9 +692,8 @@ class QwenRomanizationService:
 
         if resp.status_code in (401, 403):
             raise RomanizationAPIError(
-                f"Alibaba Cloud rejected the API key while {purpose} "
-                f"(HTTP {resp.status_code}). Check that DASHSCOPE_API_KEY is "
-                "valid and matches the configured region."
+                f"Alibaba Cloud API error while {purpose} "
+                f"(HTTP {resp.status_code}): {_sanitize_api_text(resp.text)}"
             )
         if resp.status_code != 200:
             raise RomanizationAPIError(

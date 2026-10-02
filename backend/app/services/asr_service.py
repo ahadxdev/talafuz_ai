@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import requests
+import dashscope
 
 from .. import config
 
@@ -43,8 +44,11 @@ TRANSCRIPT_FILENAME = "transcript.json"
 ASR_RAW_FILENAME = "asr_raw.json"
 
 # Supported official model names
-FILETRANS_MODEL = "qwen3-asr-flash-filetrans"  # async, timestamped
-SYNC_MODEL = "qwen3-asr-flash"                 # sync, text only (no timestamps)
+FILETRANS_MODEL = "qwen3-asr-flash-filetrans"
+SYNC_MODEL = "qwen3-asr-flash"
+SNAPSHOT_SYNC_MODEL = "qwen3-asr-flash-2026-02-10"
+
+
 
 # Official DashScope domains per region. Tuple order:
 # (workspace-specific domain suffix, legacy standard domain)
@@ -157,7 +161,7 @@ class AlibabaCloudASRProvider(ASRProvider):
         self._api_key = api_key
 
         model = config.ALIBABA_ASR_MODEL
-        if model not in (FILETRANS_MODEL, SYNC_MODEL):
+        if model not in (FILETRANS_MODEL, SYNC_MODEL, SNAPSHOT_SYNC_MODEL):
             raise ASRNotConfiguredError(
                 f"Unsupported ALIBABA_ASR_MODEL '{model}'. Supported models: "
                 f"{FILETRANS_MODEL} (timestamped, recommended) or {SYNC_MODEL} "
@@ -203,7 +207,7 @@ class AlibabaCloudASRProvider(ASRProvider):
         if audio_path.stat().st_size == 0:
             raise ASRError(f"Audio file is empty (0 bytes): {audio_path}")
 
-        if self._model == SYNC_MODEL:
+        if self._model in (SYNC_MODEL, SNAPSHOT_SYNC_MODEL):
             logger.warning(
                 "Using %s (synchronous): the official API returns text "
                 "WITHOUT timestamps; the transcript will contain a single "
@@ -470,54 +474,103 @@ class AlibabaCloudASRProvider(ASRProvider):
     # ------------------------------------------------------------------
 
     def _transcribe_sync(self, audio_path: Path) -> Dict[str, Any]:
+        """
+        Synchronous Qwen3-ASR recognition using the DashScope SDK.
+
+        The snapshot model returns recognized text but does not provide
+        sentence timestamps, so the result is represented as one segment
+        covering the full audio duration.
+        """
         size = audio_path.stat().st_size
         if size > config.ASR_SYNC_MAX_AUDIO_BYTES:
             raise ASRError(
                 f"Audio is too large ({size} bytes) for the synchronous "
-                f"{SYNC_MODEL} API (base64 limit). Use "
+                f"{self._model} API. Use "
                 f"ALIBABA_ASR_MODEL={FILETRANS_MODEL} for larger files."
             )
+
         data_uri = "data:audio/wav;base64," + base64.b64encode(
             audio_path.read_bytes()
         ).decode("ascii")
 
-        asr_options: Dict[str, Any] = {"enable_itn": False}
-        if self._language:
-            asr_options["language"] = self._language
-        payload = {
-            "model": self._model,
-            "input": {
-                "messages": [
-                    {"role": "user", "content": [{"audio": data_uri}]}
-                ]
+        messages = [
+            {
+                "role": "system",
+                "content": [{"text": ""}],
             },
-            "parameters": {"asr_options": asr_options},
-        }
+            {
+                "role": "user",
+                "content": [{"audio": data_uri}],
+            },
+        ]
+
         try:
-            resp = requests.post(
-                f"{self._base}/services/aigc/multimodal-generation/generation",
-                headers=self._auth_headers(),
-                json=payload,
-                timeout=max(config.ASR_HTTP_TIMEOUT, 300),
+            # Use the exact Singapore workspace endpoint that was
+            # successfully tested with this account/model.
+            dashscope.base_http_api_url = self._base
+
+            response = dashscope.MultiModalConversation.call(
+                api_key=self._api_key,
+                model=self._model,
+                messages=messages,
+                result_format="message",
+                asr_options={
+                    "enable_lid": True,
+                    "enable_itn": False,
+                    "enable_words": True,
+                },
             )
-        except requests.RequestException as e:
+        except Exception as e:
             raise ASRNetworkError(
-                f"Network failure while calling the ASR service: {e}"
+                f"Network failure while calling the Alibaba Cloud "
+                f"ASR service: {_sanitize_api_text(str(e))}"
             )
-        if resp.status_code != 200:
-            self._raise_for_status(resp, "calling the ASR service")
-        body = self._request_json(resp, "calling the ASR service")
+
+        # DashScope response objects provide to_dict(); keep a fallback
+        # for SDK versions that return a dict directly.
+        if isinstance(response, dict):
+            body = response
+        elif hasattr(response, "to_dict"):
+            body = response.to_dict()
+        else:
+            raise ASRResponseError(
+                "Unexpected DashScope response object type."
+            )
+
+        status_code = body.get("status_code")
+        if status_code != 200:
+            raise ASRAPIError(
+                f"Alibaba Cloud ASR request failed "
+                f"(HTTP {status_code}): "
+                f"{_sanitize_api_text(str(body))}"
+            )
 
         text = self._extract_sync_text(body)
+
         if not text:
             raise ASRResponseError(
                 "The ASR service returned no recognized text — the audio "
                 "contains no recognizable speech."
             )
-        # No timestamps available in sync mode: one segment over full audio.
+
+        # The synchronous model does not return usable timestamps.
+        # Existing Talafuz alignment/VAD can refine this later.
         duration = self._wav_duration(audio_path)
-        segments = [TranscriptSegment(id=1, start=0.0, end=duration, text=text)]
-        return {"segments": segments, "raw": body}
+
+        segments = [
+            TranscriptSegment(
+                id=1,
+                start=0.0,
+                end=duration,
+                text=text,
+            )
+        ]
+
+        return {
+            "segments": segments,
+            "raw": body,
+        }
+
 
     @staticmethod
     def _extract_sync_text(body: Dict[str, Any]) -> str:
