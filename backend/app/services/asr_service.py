@@ -1,27 +1,16 @@
+
 """
 Phase 2 — ASR (speech recognition) service abstraction.
 
-Design goals:
-- The rest of the application only depends on `get_asr_provider()` and the
-  `ASRProvider.transcribe()` contract, so the underlying provider can be
-  swapped without touching API routes or the frontend.
-- Original ASR text is preserved: no translation, no Roman Urdu
-  normalization, no punctuation rewriting (Phase 2 scope).
+Supported Alibaba Model Studio models:
+- qwen3-asr-flash-filetrans: asynchronous transcription with timestamps.
+- qwen3-asr-flash / qwen3-asr-flash-2026-02-10: synchronous SDK API.
+- qwen-audio-3.0-asr-flash: multimodal-generation HTTP API, without
+  sentence-level timestamps.
 
-ASR PROVIDER: Alibaba Cloud Model Studio — Qwen3-ASR.
-
-Official API surface used (Alibaba Cloud Model Studio documentation):
-- `qwen3-asr-flash-filetrans` (DashScope async task API): sentence-level
-  timestamps in milliseconds. The local audio.wav is first uploaded through
-  the official temporary-upload API (getPolicy → OSS multipart) to obtain
-  an oss:// URL, then an async transcription task is submitted and polled.
-- `qwen3-asr-flash` (DashScope synchronous multimodal-generation API):
-  plain-text recognition WITHOUT timestamps. Supported only as a fallback
-  mode; it yields a single segment covering the whole audio duration.
-
-Authentication uses a Model Studio API key (DASHSCOPE_API_KEY); the legacy
-ALIBABA_CLOUD_ACCESS_KEY_ID / _SECRET variables are not used.
+Original ASR text is preserved without translation or normalization.
 """
+
 import base64
 import json
 import logging
@@ -42,35 +31,34 @@ logger = logging.getLogger(__name__)
 
 TRANSCRIPT_FILENAME = "transcript.json"
 ASR_RAW_FILENAME = "asr_raw.json"
-
-# Supported official model names
 FILETRANS_MODEL = "qwen3-asr-flash-filetrans"
 SYNC_MODEL = "qwen3-asr-flash"
 SNAPSHOT_SYNC_MODEL = "qwen3-asr-flash-2026-02-10"
+AUDIO30_SYNC_MODEL = "qwen-audio-3.0-asr-flash"
 
-
-
-# Official DashScope domains per region. Tuple order:
-# (workspace-specific domain suffix, legacy standard domain)
 _REGION_DOMAINS = {
-    "singapore": ("ap-southeast-1.maas.aliyuncs.com", "dashscope-intl.aliyuncs.com"),
-    "beijing": ("cn-beijing.maas.aliyuncs.com", "dashscope.aliyuncs.com"),
+    "singapore": (
+        "ap-southeast-1.maas.aliyuncs.com",
+        "dashscope-intl.aliyuncs.com",
+    ),
+    "beijing": (
+        "cn-beijing.maas.aliyuncs.com",
+        "dashscope.aliyuncs.com",
+    ),
 }
 
-# Strip anything that could look like an API key before surfacing
-# error text coming back from the provider.
 _SECRET_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{6,}")
 
 
 def _sanitize_api_text(text: str) -> str:
-    """Redact key-like tokens and truncate provider error text for logging."""
+    """Redact key-like tokens and truncate provider error text."""
     if not text:
         return ""
     return _SECRET_PATTERN.sub("[REDACTED]", text)[:500]
 
 
 class ASRNotConfiguredError(RuntimeError):
-    """Raised when no ASR provider is configured or credentials are missing."""
+    """Raised when ASR is not configured or credentials are missing."""
 
 
 class ASRError(RuntimeError):
@@ -95,7 +83,7 @@ class ASRResponseError(ASRError):
 
 @dataclass
 class TranscriptSegment:
-    """One timestamped piece of recognized speech (seconds)."""
+    """One piece of recognized speech; timestamps are in seconds."""
     id: int
     start: float
     end: float
@@ -117,36 +105,12 @@ class ASRProvider(ABC):
 
     @abstractmethod
     def transcribe(self, audio_path: Path) -> Dict[str, Any]:
-        """
-        Run speech recognition on an audio file.
-
-        Returns a dict:
-            segments: list[TranscriptSegment]  (required)
-            raw:      provider-native response (optional, kept for debugging)
-
-        Raises ASRNotConfiguredError if the provider cannot run.
-        """
+        """Return {'segments': list[TranscriptSegment], 'raw': provider data}."""
         raise NotImplementedError
 
 
 class AlibabaCloudASRProvider(ASRProvider):
-    """
-    Alibaba Cloud Model Studio provider for Qwen3-ASR.
-
-    Default mode: `qwen3-asr-flash-filetrans` (async task) — the only
-    official Qwen3-ASR variant that returns timestamps:
-      1. Upload local audio.wav via the official temporary-upload API
-         (getPolicy → OSS multipart) → oss:// URL (valid 48 h).
-      2. Submit an async transcription task (X-DashScope-Async: enable).
-      3. Poll the task until SUCCEEDED / FAILED / UNKNOWN or timeout.
-      4. Download `output.result.transcription_url` (JSON) and map
-         `transcripts[].sentences[]` (begin_time/end_time in ms) into
-         TranscriptSegment objects (seconds). Original text untouched.
-
-    Fallback mode: `qwen3-asr-flash` (sync) — recognizes base64-encoded
-    audio directly but the official API returns plain text WITHOUT
-    timestamps, so a single segment spanning the whole audio is emitted.
-    """
+    """Alibaba Cloud Model Studio ASR provider."""
 
     name = "alibaba"
 
@@ -154,51 +118,47 @@ class AlibabaCloudASRProvider(ASRProvider):
         api_key = config.DASHSCOPE_API_KEY
         if not api_key:
             raise ASRNotConfiguredError(
-                "Alibaba Cloud ASR is selected but DASHSCOPE_API_KEY is not "
-                "set. Add a Model Studio API key to the project root .env "
-                "(DASHSCOPE_API_KEY=...) and restart the backend."
+                "Alibaba Cloud ASR is selected but DASHSCOPE_API_KEY is not set. "
+                "Add a Model Studio API key to the project .env and restart."
             )
         self._api_key = api_key
 
         model = config.ALIBABA_ASR_MODEL
-        if model not in (FILETRANS_MODEL, SYNC_MODEL, SNAPSHOT_SYNC_MODEL):
+        supported_models = (
+            FILETRANS_MODEL,
+            SYNC_MODEL,
+            SNAPSHOT_SYNC_MODEL,
+            AUDIO30_SYNC_MODEL,
+        )
+        if model not in supported_models:
             raise ASRNotConfiguredError(
                 f"Unsupported ALIBABA_ASR_MODEL '{model}'. Supported models: "
-                f"{FILETRANS_MODEL} (timestamped, recommended) or {SYNC_MODEL} "
-                "(text only, no timestamps)."
+                f"{FILETRANS_MODEL}, {SYNC_MODEL}, {SNAPSHOT_SYNC_MODEL}, "
+                f"{AUDIO30_SYNC_MODEL}."
             )
         self._model = model
 
         region = config.ALIBABA_ASR_REGION
         if region not in _REGION_DOMAINS:
             raise ASRNotConfiguredError(
-                f"Unsupported ALIBABA_ASR_REGION '{region}'. "
-                f"Supported regions: {', '.join(sorted(_REGION_DOMAINS))}."
+                f"Unsupported ALIBABA_ASR_REGION '{region}'. Supported regions: "
+                f"{', '.join(sorted(_REGION_DOMAINS))}."
             )
         self._region = region
 
         workspace_id = config.ALIBABA_WORKSPACE_ID
         ws_domain, legacy_domain = _REGION_DOMAINS[region]
         host = f"{workspace_id}.{ws_domain}" if workspace_id else legacy_domain
-        # Never log the full endpoint construction with secrets — host is safe.
         self._base = f"https://{host}/api/v1"
 
-        # The official Qwen3-ASR API accepts a single language code (e.g.
-        # "hi" or "en"). Multiple hints are configured comma-separated but
-        # only the first one is sent; leaving it empty enables automatic
-        # language detection (recommended for code-switched speech).
-        hints = [h.strip() for h in config.ALIBABA_ASR_LANGUAGE_HINTS.split(",") if h.strip()]
+        raw_hints = getattr(config, "ALIBABA_ASR_LANGUAGE_HINTS", "") or ""
+        hints = [h.strip() for h in raw_hints.split(",") if h.strip()]
         if len(hints) > 1:
             logger.warning(
-                "ALIBABA_ASR_LANGUAGE_HINTS contains %d values but the "
-                "Qwen3-ASR API accepts a single language; using '%s'.",
-                len(hints), hints[0],
+                "ALIBABA_ASR_LANGUAGE_HINTS contains multiple values; using '%s'.",
+                hints[0],
             )
         self._language = hints[0] if hints else None
-
-    # ------------------------------------------------------------------
-    # Public contract
-    # ------------------------------------------------------------------
 
     def transcribe(self, audio_path: Path) -> Dict[str, Any]:
         audio_path = Path(audio_path)
@@ -207,18 +167,23 @@ class AlibabaCloudASRProvider(ASRProvider):
         if audio_path.stat().st_size == 0:
             raise ASRError(f"Audio file is empty (0 bytes): {audio_path}")
 
+        if self._model == AUDIO30_SYNC_MODEL:
+            logger.warning(
+                "%s returns text without sentence timestamps; creating one "
+                "segment covering the full audio.",
+                self._model,
+            )
+            return self._transcribe_audio30_sync(audio_path)
+
         if self._model in (SYNC_MODEL, SNAPSHOT_SYNC_MODEL):
             logger.warning(
-                "Using %s (synchronous): the official API returns text "
-                "WITHOUT timestamps; the transcript will contain a single "
-                "segment covering the whole audio.", self._model,
+                "%s returns text without sentence timestamps; creating one "
+                "segment covering the full audio.",
+                self._model,
             )
             return self._transcribe_sync(audio_path)
-        return self._transcribe_filetrans(audio_path)
 
-    # ------------------------------------------------------------------
-    # Shared helpers
-    # ------------------------------------------------------------------
+        return self._transcribe_filetrans(audio_path)
 
     def _auth_headers(self) -> Dict[str, str]:
         return {
@@ -228,29 +193,31 @@ class AlibabaCloudASRProvider(ASRProvider):
 
     @staticmethod
     def _raise_for_status(resp: requests.Response, action: str) -> None:
-        """Convert non-200 responses into ASRAPIError (secrets redacted)."""
         raise ASRAPIError(
-            f"Alibaba Cloud API error while {action} "
-            f"(HTTP {resp.status_code}): {_sanitize_api_text(resp.text)}"
+            f"Alibaba Cloud API error while {action} (HTTP {resp.status_code}): "
+            f"{_sanitize_api_text(resp.text)}"
         )
 
     @staticmethod
     def _request_json(resp: requests.Response, action: str) -> Dict[str, Any]:
         try:
-            return resp.json()
-        except ValueError:
+            body = resp.json()
+        except ValueError as exc:
             raise ASRResponseError(
-                f"Alibaba Cloud returned a non-JSON response while {action}: "
+                f"Alibaba Cloud returned non-JSON data while {action}: "
                 f"{_sanitize_api_text(resp.text)}"
+            ) from exc
+        if not isinstance(body, dict):
+            raise ASRResponseError(
+                f"Alibaba Cloud returned an unexpected JSON value while {action}."
             )
+        return body
 
-    # ------------------------------------------------------------------
-    # filetrans mode: upload → submit → poll → download → map segments
-    # ------------------------------------------------------------------
+    # Timestamped filetrans model: upload -> submit -> poll -> download
 
     def _transcribe_filetrans(self, audio_path: Path) -> Dict[str, Any]:
         file_url = self._upload_for_transcription(audio_path)
-        logger.info("Audio uploaded to temporary storage; submitting %s task", self._model)
+        logger.info("Audio uploaded; submitting %s transcription task", self._model)
         task_id = self._submit_transcription_task(file_url)
         logger.info("Transcription task submitted: %s", task_id)
         query_data = self._wait_for_task(task_id)
@@ -266,10 +233,7 @@ class AlibabaCloudASRProvider(ASRProvider):
         return {"segments": segments, "raw": raw}
 
     def _upload_for_transcription(self, audio_path: Path) -> str:
-        """
-        Official temporary-upload flow: getPolicy → OSS multipart upload →
-        oss:// URL (valid for 48 hours, development/testing use).
-        """
+        """Request temporary OSS credentials and upload the local audio file."""
         try:
             policy_resp = requests.get(
                 f"{self._base}/uploads",
@@ -277,24 +241,24 @@ class AlibabaCloudASRProvider(ASRProvider):
                 params={"action": "getPolicy", "model": self._model},
                 timeout=config.ASR_HTTP_TIMEOUT,
             )
-        except requests.RequestException as e:
+        except requests.RequestException as exc:
             raise ASRNetworkError(
-                f"Network failure while requesting an upload credential from "
-                f"Alibaba Cloud: {e}"
-            )
+                f"Network failure while requesting upload credentials: {exc}"
+            ) from exc
+
         if policy_resp.status_code != 200:
-            self._raise_for_status(policy_resp, "requesting an upload credential")
-        policy = self._request_json(policy_resp, "requesting an upload credential")
+            self._raise_for_status(policy_resp, "requesting upload credentials")
+
+        policy = self._request_json(policy_resp, "requesting upload credentials")
         data = policy.get("data") or {}
         required = (
             "policy", "signature", "upload_dir", "upload_host",
             "oss_access_key_id", "x_oss_object_acl", "x_oss_forbid_overwrite",
         )
-        missing = [k for k in required if not data.get(k)]
+        missing = [key for key in required if not data.get(key)]
         if missing:
             raise ASRResponseError(
-                "Upload credential response is missing required fields: "
-                f"{', '.join(missing)}"
+                "Upload credential response is missing fields: " + ", ".join(missing)
             )
 
         key = f"{data['upload_dir']}/{audio_path.name}"
@@ -311,15 +275,18 @@ class AlibabaCloudASRProvider(ASRProvider):
                     "file": (audio_path.name, audio_file),
                 }
                 upload_resp = requests.post(
-                    data["upload_host"], files=files,
+                    data["upload_host"],
+                    files=files,
                     timeout=config.ASR_HTTP_TIMEOUT,
                 )
-        except requests.RequestException as e:
-            raise ASRNetworkError(f"Network failure while uploading audio: {e}")
+        except requests.RequestException as exc:
+            raise ASRNetworkError(
+                f"Network failure while uploading audio: {exc}"
+            ) from exc
+
         if upload_resp.status_code != 200:
             raise ASRAPIError(
-                "Audio upload to temporary storage failed (HTTP "
-                f"{upload_resp.status_code}): "
+                f"Temporary audio upload failed (HTTP {upload_resp.status_code}): "
                 f"{_sanitize_api_text(upload_resp.text)}"
             )
         return f"oss://{key}"
@@ -328,10 +295,11 @@ class AlibabaCloudASRProvider(ASRProvider):
         parameters: Dict[str, Any] = {
             "channel_id": [0],
             "enable_itn": False,
-            "enable_words": config.ALIBABA_ASR_ENABLE_WORDS,
+            "enable_words": getattr(config, "ALIBABA_ASR_ENABLE_WORDS", False),
         }
         if self._language:
             parameters["language"] = self._language
+
         payload = {
             "model": self._model,
             "input": {"file_url": file_url},
@@ -339,8 +307,8 @@ class AlibabaCloudASRProvider(ASRProvider):
         }
         headers = self._auth_headers()
         headers["X-DashScope-Async"] = "enable"
-        # Required when passing an oss:// temporary URL to the model.
         headers["X-DashScope-OssResourceResolve"] = "enable"
+
         try:
             resp = requests.post(
                 f"{self._base}/services/audio/asr/transcription",
@@ -348,30 +316,31 @@ class AlibabaCloudASRProvider(ASRProvider):
                 json=payload,
                 timeout=config.ASR_HTTP_TIMEOUT,
             )
-        except requests.RequestException as e:
+        except requests.RequestException as exc:
             raise ASRNetworkError(
-                f"Network failure while submitting the transcription task: {e}"
-            )
+                f"Network failure while submitting transcription task: {exc}"
+            ) from exc
+
         if resp.status_code != 200:
-            self._raise_for_status(resp, "submitting the transcription task")
-        body = self._request_json(resp, "submitting the transcription task")
+            self._raise_for_status(resp, "submitting transcription task")
+        body = self._request_json(resp, "submitting transcription task")
         task_id = (body.get("output") or {}).get("task_id")
         if not task_id:
             raise ASRResponseError(
-                "Task submission response did not contain a task_id: "
+                "Task submission response did not contain task_id: "
                 f"{_sanitize_api_text(resp.text)}"
             )
-        return task_id
+        return str(task_id)
 
     def _wait_for_task(self, task_id: str) -> Dict[str, Any]:
-        """Poll the task until a terminal status or ASR_TASK_TIMEOUT."""
         deadline = time.monotonic() + config.ASR_TASK_TIMEOUT
         terminal = {"SUCCEEDED", "FAILED", "UNKNOWN"}
+
         while True:
             if time.monotonic() > deadline:
                 raise ASRTimeoutError(
                     f"Transcription task {task_id} did not finish within "
-                    f"{config.ASR_TASK_TIMEOUT}s (ASR_TASK_TIMEOUT)."
+                    f"{config.ASR_TASK_TIMEOUT}s."
                 )
             time.sleep(config.ASR_TASK_POLL_INTERVAL)
             try:
@@ -380,13 +349,14 @@ class AlibabaCloudASRProvider(ASRProvider):
                     headers=self._auth_headers(),
                     timeout=config.ASR_HTTP_TIMEOUT,
                 )
-            except requests.RequestException as e:
+            except requests.RequestException as exc:
                 raise ASRNetworkError(
-                    f"Network failure while polling the transcription task: {e}"
-                )
+                    f"Network failure while polling transcription task: {exc}"
+                ) from exc
+
             if resp.status_code != 200:
-                self._raise_for_status(resp, "polling the transcription task")
-            body = self._request_json(resp, "polling the transcription task")
+                self._raise_for_status(resp, "polling transcription task")
+            body = self._request_json(resp, "polling transcription task")
             output = body.get("output") or {}
             status = str(output.get("task_status", "")).upper()
             if not status:
@@ -395,22 +365,24 @@ class AlibabaCloudASRProvider(ASRProvider):
                     f"{_sanitize_api_text(resp.text)}"
                 )
             logger.debug("Transcription task %s status: %s", task_id, status)
+
             if status not in terminal:
                 continue
             if status != "SUCCEEDED":
                 detail = output.get("message") or output.get("code") or resp.text
                 raise ASRAPIError(
-                    f"Alibaba Cloud transcription task failed "
-                    f"(status={status}): {_sanitize_api_text(str(detail))}"
+                    f"Transcription task failed (status={status}): "
+                    f"{_sanitize_api_text(str(detail))}"
                 )
             return body
 
-    def _download_transcription_result(self, query_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _download_transcription_result(
+        self, query_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         output = query_data.get("output") or {}
         result = output.get("result") or {}
         transcription_url = result.get("transcription_url")
         if not transcription_url:
-            # Tolerate the multi-file response shape as well.
             results = output.get("results") or []
             if results and isinstance(results[0], dict):
                 transcription_url = results[0].get("transcription_url")
@@ -418,34 +390,35 @@ class AlibabaCloudASRProvider(ASRProvider):
             raise ASRResponseError(
                 "Task succeeded but no transcription_url was returned."
             )
+
         try:
-            resp = requests.get(transcription_url, timeout=config.ASR_HTTP_TIMEOUT)
-        except requests.RequestException as e:
-            raise ASRNetworkError(
-                f"Network failure while downloading the transcription result: {e}"
+            resp = requests.get(
+                transcription_url, timeout=config.ASR_HTTP_TIMEOUT
             )
+        except requests.RequestException as exc:
+            raise ASRNetworkError(
+                f"Network failure while downloading transcription result: {exc}"
+            ) from exc
         if resp.status_code != 200:
             raise ASRAPIError(
-                "Failed to download the transcription result (HTTP "
-                f"{resp.status_code})."
+                f"Failed to download transcription result (HTTP {resp.status_code})."
             )
-        return self._request_json(resp, "downloading the transcription result")
+        return self._request_json(resp, "downloading transcription result")
 
     def _map_sentences(self, result_doc: Dict[str, Any]) -> List[TranscriptSegment]:
         transcripts = result_doc.get("transcripts")
         if not isinstance(transcripts, list) or not transcripts:
             raise ASRResponseError(
-                "The ASR result contains no transcripts — the audio could "
-                "not be recognized or contains no speech."
+                "ASR result contains no transcripts or no recognizable speech."
             )
         sentences = transcripts[0].get("sentences")
         if not isinstance(sentences, list) or not sentences:
-            raise ASRResponseError(
-                "The ASR result contains no sentences — no speech was "
-                "recognized in the audio."
-            )
+            raise ASRResponseError("ASR result contains no timestamped sentences.")
+
         segments: List[TranscriptSegment] = []
         for sentence in sentences:
+            if not isinstance(sentence, dict):
+                continue
             text = (sentence.get("text") or "").strip()
             if not text:
                 continue
@@ -453,9 +426,7 @@ class AlibabaCloudASRProvider(ASRProvider):
             end = sentence.get("end_time")
             if begin is None or end is None:
                 raise ASRResponseError(
-                    "A recognized sentence is missing timestamps "
-                    "(begin_time/end_time); cannot build a timestamped "
-                    "transcript."
+                    "Recognized sentence is missing begin_time/end_time timestamps."
                 )
             segments.append(TranscriptSegment(
                 id=len(segments) + 1,
@@ -464,51 +435,116 @@ class AlibabaCloudASRProvider(ASRProvider):
                 text=text,
             ))
         if not segments:
-            raise ASRResponseError(
-                "The ASR result contains no recognizable speech text."
-            )
+            raise ASRResponseError("ASR result contains no recognized speech text.")
         return segments
 
-    # ------------------------------------------------------------------
-    # Sync mode: qwen3-asr-flash (text only, NO timestamps)
-    # ------------------------------------------------------------------
+    # Qwen-Audio-3.0-ASR-Flash: HTTP API, without timestamps
 
-    def _transcribe_sync(self, audio_path: Path) -> Dict[str, Any]:
-        """
-        Synchronous Qwen3-ASR recognition using the DashScope SDK.
-
-        The snapshot model returns recognized text but does not provide
-        sentence timestamps, so the result is represented as one segment
-        covering the full audio duration.
-        """
-        size = audio_path.stat().st_size
-        if size > config.ASR_SYNC_MAX_AUDIO_BYTES:
+    def _transcribe_audio30_sync(self, audio_path: Path) -> Dict[str, Any]:
+        """Recognize WAV audio with qwen-audio-3.0-asr-flash."""
+        try:
+            with wave.open(str(audio_path), "rb") as wav:
+                sample_rate = wav.getframerate()
+            if sample_rate <= 0:
+                raise ASRError("The WAV file has an invalid sample rate.")
+        except (wave.Error, OSError, EOFError) as exc:
             raise ASRError(
-                f"Audio is too large ({size} bytes) for the synchronous "
-                f"{self._model} API. Use "
-                f"ALIBABA_ASR_MODEL={FILETRANS_MODEL} for larger files."
+                f"Qwen-Audio ASR expects a valid WAV file: {exc}"
+            ) from exc
+
+        size = audio_path.stat().st_size
+        max_bytes = getattr(config, "ASR_SYNC_MAX_AUDIO_BYTES", 10 * 1024 * 1024)
+        if size > max_bytes:
+            raise ASRError(
+                f"Audio is too large ({size} bytes) for the configured request "
+                f"limit ({max_bytes} bytes). Shorten/compress it or use "
+                f"ALIBABA_ASR_MODEL={FILETRANS_MODEL}."
             )
 
         data_uri = "data:audio/wav;base64," + base64.b64encode(
             audio_path.read_bytes()
         ).decode("ascii")
+        payload = {
+            "model": AUDIO30_SYNC_MODEL,
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": {"data": data_uri},
+                    }],
+                }],
+            },
+            "parameters": {
+                "format": "wav",
+                "sample_rate": str(sample_rate),
+            },
+        }
 
+        try:
+            resp = requests.post(
+                f"{self._base}/services/aigc/multimodal-generation/generation",
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=config.ASR_HTTP_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise ASRNetworkError(
+                f"Network failure while calling Qwen-Audio ASR: {exc}"
+            ) from exc
+
+        if resp.status_code != 200:
+            self._raise_for_status(resp, "transcribing audio with Qwen-Audio")
+
+        body = self._request_json(resp, "transcribing audio with Qwen-Audio")
+        output = body.get("output") or {}
+        nested_output = output.get("output") or {}
+        sentence = nested_output.get("sentence") or {}
+        text = sentence.get("text") or output.get("text") or ""
+        if not isinstance(text, str):
+            text = ""
+        text = text.strip()
+
+        if not text:
+            if body.get("code"):
+                raise ASRAPIError(
+                    "Qwen-Audio ASR reported an error: "
+                    f"{_sanitize_api_text(json.dumps(body, ensure_ascii=False))}"
+                )
+            raise ASRResponseError(
+                "Qwen-Audio ASR returned no recognized text. Check the audio, "
+                "model availability, region, and workspace configuration."
+            )
+
+        duration = self._wav_duration(audio_path)
+        return {
+            "segments": [
+                TranscriptSegment(id=1, start=0.0, end=duration, text=text)
+            ],
+            "raw": body,
+        }
+
+    # Qwen3-ASR synchronous SDK API, without timestamps
+
+    def _transcribe_sync(self, audio_path: Path) -> Dict[str, Any]:
+        size = audio_path.stat().st_size
+        max_bytes = getattr(config, "ASR_SYNC_MAX_AUDIO_BYTES", 10 * 1024 * 1024)
+        if size > max_bytes:
+            raise ASRError(
+                f"Audio is too large ({size} bytes) for synchronous {self._model}. "
+                f"Use ALIBABA_ASR_MODEL={FILETRANS_MODEL} for larger files."
+            )
+
+        data_uri = "data:audio/wav;base64," + base64.b64encode(
+            audio_path.read_bytes()
+        ).decode("ascii")
         messages = [
-            {
-                "role": "system",
-                "content": [{"text": ""}],
-            },
-            {
-                "role": "user",
-                "content": [{"audio": data_uri}],
-            },
+            {"role": "system", "content": [{"text": ""}]},
+            {"role": "user", "content": [{"audio": data_uri}]},
         ]
 
         try:
-            # Use the exact Singapore workspace endpoint that was
-            # successfully tested with this account/model.
             dashscope.base_http_api_url = self._base
-
             response = dashscope.MultiModalConversation.call(
                 api_key=self._api_key,
                 model=self._model,
@@ -520,110 +556,79 @@ class AlibabaCloudASRProvider(ASRProvider):
                     "enable_words": True,
                 },
             )
-        except Exception as e:
+        except Exception as exc:
             raise ASRNetworkError(
-                f"Network failure while calling the Alibaba Cloud "
-                f"ASR service: {_sanitize_api_text(str(e))}"
-            )
+                f"Failure while calling Alibaba Cloud ASR: "
+                f"{_sanitize_api_text(str(exc))}"
+            ) from exc
 
-        # DashScope response objects provide to_dict(); keep a fallback
-        # for SDK versions that return a dict directly.
         if isinstance(response, dict):
             body = response
         elif hasattr(response, "to_dict"):
             body = response.to_dict()
         else:
-            raise ASRResponseError(
-                "Unexpected DashScope response object type."
-            )
+            raise ASRResponseError("Unexpected DashScope response object type.")
 
-        status_code = body.get("status_code")
-        if status_code != 200:
+        if body.get("status_code") != 200:
             raise ASRAPIError(
                 f"Alibaba Cloud ASR request failed "
-                f"(HTTP {status_code}): "
+                f"(HTTP {body.get('status_code')}): "
                 f"{_sanitize_api_text(str(body))}"
             )
 
         text = self._extract_sync_text(body)
-
         if not text:
-            raise ASRResponseError(
-                "The ASR service returned no recognized text — the audio "
-                "contains no recognizable speech."
-            )
-
-        # The synchronous model does not return usable timestamps.
-        # Existing Talafuz alignment/VAD can refine this later.
-        duration = self._wav_duration(audio_path)
-
-        segments = [
-            TranscriptSegment(
-                id=1,
-                start=0.0,
-                end=duration,
-                text=text,
-            )
-        ]
+            raise ASRResponseError("The ASR service returned no recognized text.")
 
         return {
-            "segments": segments,
+            "segments": [
+                TranscriptSegment(
+                    id=1, start=0.0, end=self._wav_duration(audio_path), text=text
+                )
+            ],
             "raw": body,
         }
 
-
     @staticmethod
     def _extract_sync_text(body: Dict[str, Any]) -> str:
-        """Read recognized text from the DashScope sync response."""
         try:
             content = body["output"]["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
             raise ASRResponseError(
-                "Unexpected ASR response structure: output.choices[0].message"
-                ".content is missing."
+                "Unexpected ASR response structure: "
+                "output.choices[0].message.content is missing."
             )
         if isinstance(content, str):
             return content.strip()
         if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-            return "".join(parts).strip()
+            return "".join(
+                item["text"] for item in content
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ).strip()
         raise ASRResponseError("Unexpected ASR response content type.")
 
     @staticmethod
     def _wav_duration(audio_path: Path) -> float:
-        """Best-effort WAV duration in seconds (0.0 when unreadable)."""
+        """Return WAV duration in seconds; 0.0 if unreadable."""
         try:
             with wave.open(str(audio_path), "rb") as wav:
                 frames = wav.getnframes()
-                rate = wav.getframerate() or 1
-                return frames / rate
+                rate = wav.getframerate()
+                return frames / rate if rate else 0.0
         except (wave.Error, OSError, EOFError):
             return 0.0
 
 
 def get_asr_provider() -> ASRProvider:
-    """
-    Factory: return the configured ASR provider based on ASR_PROVIDER env.
-
-    Raises ASRNotConfiguredError when speech recognition has not been
-    configured yet (the default state of this project).
-    """
+    """Return the ASR provider configured by ASR_PROVIDER."""
     provider_name = config.ASR_PROVIDER
     if provider_name == "alibaba":
         return AlibabaCloudASRProvider()
     raise ASRNotConfiguredError(
-        "Speech recognition (ASR) has not been configured yet. "
-        "Set ASR_PROVIDER in the project root .env (e.g. ASR_PROVIDER=alibaba) "
-        "and provide the provider credentials to enable transcription."
+        "Speech recognition (ASR) has not been configured yet. Set "
+        "ASR_PROVIDER=alibaba in the project root .env and provide credentials."
     )
 
-
-# ---------------------------------------------------------------------------
-# Transcript storage (job directory, no database)
-# ---------------------------------------------------------------------------
 
 def save_transcript(
     job_dir: Path,
@@ -632,37 +637,34 @@ def save_transcript(
     provider_name: str,
     raw: Optional[Any] = None,
 ) -> Path:
-    """
-    Persist the standardized transcript as transcript.json in the job
-    directory. Raw provider output (when available) is kept separately in
-    asr_raw.json for debugging.
-    """
+    """Save standardized transcript JSON and optional raw provider response."""
     job_dir = Path(job_dir)
+    job_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = job_dir / TRANSCRIPT_FILENAME
     payload = {
         "job_id": job_id,
         "provider": provider_name,
-        "segments": [s.to_dict() for s in segments],
+        "segments": [segment.to_dict() for segment in segments],
     }
     transcript_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     if raw is not None:
-        raw_path = job_dir / ASR_RAW_FILENAME
         try:
-            raw_path.write_text(
+            (job_dir / ASR_RAW_FILENAME).write_text(
                 json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except (TypeError, ValueError):
-            # Non-serializable raw payload: keep transcript, skip raw dump.
-            pass
+        except (TypeError, ValueError, OSError):
+            logger.warning(
+                "Could not serialize raw ASR response; transcript was saved."
+            )
 
     return transcript_path
 
 
 def load_transcript(job_dir: Path) -> Optional[Dict[str, Any]]:
-    """Load transcript.json from a job directory; None if absent/invalid."""
+    """Load transcript.json; return None if absent, unreadable, or invalid."""
     transcript_path = Path(job_dir) / TRANSCRIPT_FILENAME
     if not transcript_path.exists():
         return None
